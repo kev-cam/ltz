@@ -37,12 +37,53 @@ KiCad Schematic Editor
 - [ ] Interposer design flow (KiCad PCB editor for chiplet substrates)
 - [ ] Federated simulation bridge (Xyce + NVC + gHDL + Verilator)
 
+## Quick Start
+
+```bash
+# Clone ltz
+git clone https://github.com/kev-cam/ltz.git
+cd ltz
+
+# Fetch LTspice community test circuits into ../ltz-tests
+./scripts/fetch_tests.sh
+
+# Scan for Xyce compatibility
+python3 tools/ltz_convert.py --scan ../ltz-tests/ecircuit/
+
+# Batch convert self-contained circuits
+python3 tools/ltz_convert.py --batch --self-contained ../ltz-tests/ecircuit/ -o tests/converted/
+
+# Run a circuit through Xyce
+Xyce tests/converted/00_RC_LOW_PASS_FILTER/Lpfilter1.cir
+```
+
 ## Dependencies
 
-- [KiCad](https://www.kicad.org/) 9.0+
-- [Xyce](https://xyce.sandia.gov/) 7.8+
+- [Xyce](https://xyce.sandia.gov/) 7.8+ (built from source or package)
 - Python 3.10+
-- [spicelib](https://github.com/nunobrum/spicelib) (LTspice .asc parsing)
+- [spicelib](https://github.com/nunobrum/spicelib) (LTspice .asc parsing — `pip install spicelib`)
+- [KiCad](https://www.kicad.org/) 9.0+ (later phases only — not needed yet)
+
+## Repository Layout
+
+```
+ltz/
+├── MISSION.md              # Project vision
+├── README.md
+├── scripts/
+│   └── fetch_tests.sh      # Populates ../ltz-tests with community circuits
+├── tools/
+│   └── ltz_convert.py      # LTspice → Xyce netlist converter
+└── tests/
+    └── converted/           # Xyce-ready netlists (generated)
+
+../ltz-tests/                # Sibling dir (not in repo, created by fetch_tests.sh)
+├── circuits-ltspice/        # mick001 educational circuits
+├── ecircuit/                # eCircuit Center .cir netlists
+├── powersim/                # Power electronics simulations
+├── spice-libraries/         # Community SPICE models
+└── ...
+```
 
 ## License
 
