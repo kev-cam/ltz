@@ -1,0 +1,952 @@
+#!/usr/bin/env perl
+#
+# ltz - LTspice-compatible CLI wrapper for Xyce SPICE simulation
+#
+# Part of the ltz project: https://github.com/kev-cam/ltz
+#
+# Usage:
+#   ltz -b circuit.cir          # batch simulate via Xyce
+#   ltz -b circuit.asc          # convert .asc schematic, then simulate
+#   ltz -netlist circuit.asc    # export Xyce-compatible netlist only
+#   ltz -o output circuit.cir   # specify output path
+#
+
+use strict;
+use warnings;
+use File::Basename qw(dirname basename fileparse);
+use File::Spec;
+use File::Temp qw(tempdir);
+use Getopt::Long qw(:config no_ignore_case);
+use Cwd qw(abs_path);
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+
+my $VERSION = '0.1.0';
+
+my $SCRIPT_DIR = dirname(abs_path($0));
+my $REPO_ROOT  = dirname($SCRIPT_DIR);
+
+my $opt_batch   = 0;
+my $opt_netlist = 0;
+my $opt_output  = '';
+my $opt_ascii   = 0;
+my $opt_verbose = 0;
+my $opt_help    = 0;
+my $opt_version = 0;
+my $opt_no_lib  = 0;
+
+# Pin offsets for common LTspice symbols, in default (R0) orientation.
+# Pin order matches SPICE node order for the component prefix.
+# Two-terminal:  pin0 = positive/anode/in,  pin1 = negative/cathode/out
+# Three-terminal BJT:  C, B, E  (collector, base, emitter)
+# MOSFET:  D, G, S, [B]  (drain, gate, source, bulk)
+
+my %SYMBOL_PINS = (
+    # Empirically derived pin offsets from SYMBOL anchor in R0 orientation.
+    # Two-terminal passives
+    'res'     => { prefix => 'R', pins => [[16,16],[16,96]] },
+    'res2'    => { prefix => 'R', pins => [[16,16],[16,96]] },
+    'cap'     => { prefix => 'C', pins => [[16,0],[16,64]] },
+    'polcap'  => { prefix => 'C', pins => [[16,0],[16,64]] },
+    'ind'     => { prefix => 'L', pins => [[16,16],[16,96]] },
+    'ind2'    => { prefix => 'L', pins => [[16,16],[16,96]] },
+    # Diodes: anode, cathode
+    'diode'   => { prefix => 'D', pins => [[16,0],[16,64]] },
+    'led'     => { prefix => 'D', pins => [[16,0],[16,64]] },
+    'zener'   => { prefix => 'D', pins => [[16,0],[16,64]] },
+    'schottky'=> { prefix => 'D', pins => [[16,0],[16,64]] },
+    # Sources: +terminal, -terminal (voltage verified across 3 instances in diff pair)
+    'voltage' => { prefix => 'V', pins => [[0,16],[0,96]] },
+    'current' => { prefix => 'I', pins => [[0,16],[0,96]] },
+    # BJT NPN: collector, base, emitter (verified from 3 NPNs in diff pair)
+    'npn'     => { prefix => 'Q', pins => [[64,-48],[0,48],[64,96]] },
+    'npn2'    => { prefix => 'Q', pins => [[64,-48],[0,48],[64,96]] },
+    # BJT PNP: collector, base, emitter (emitter at top, collector at bottom)
+    'pnp'     => { prefix => 'Q', pins => [[64,96],[0,48],[64,-48]] },
+    'pnp2'    => { prefix => 'Q', pins => [[64,96],[0,48],[64,-48]] },
+    # MOSFET NMOS: drain, gate, source, [bulk] (verified from source follower trace)
+    'nmos'    => { prefix => 'M', pins => [[48,0],[0,80],[48,96],[48,96]] },
+    'nmos3'   => { prefix => 'M', pins => [[48,0],[0,80],[48,96]] },
+    # MOSFET PMOS: drain, gate, source, [bulk] (PMOS: drain at bottom, source at top)
+    'pmos'    => { prefix => 'M', pins => [[48,96],[0,80],[48,0],[48,0]] },
+    'pmos3'   => { prefix => 'M', pins => [[48,96],[0,80],[48,0]] },
+    # Opamps (subcircuit): In+, In-, V+, V-, Out (SpiceOrder 1-5 from OP07.asy)
+    'opamp'   => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'opamp2'  => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'op07'    => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'lt1001'  => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'lm741'   => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'lf411'   => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'tl072'   => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'tl082'   => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'lm358'   => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'ad8065'  => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'ad8610'  => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'opa2134' => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+    'universalopamp2' => { prefix => 'X', pins => [[-32,80],[-32,48],[0,32],[0,96],[32,64]] },
+);
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+GetOptions(
+    'b'         => \$opt_batch,
+    'netlist'   => \$opt_netlist,
+    'o=s'       => \$opt_output,
+    'ascii'     => \$opt_ascii,
+    'v|verbose' => \$opt_verbose,
+    'h|help'    => \$opt_help,
+    'version'   => \$opt_version,
+    'no-lib'    => \$opt_no_lib,
+) or usage_exit();
+
+if ($opt_version) {
+    print "ltz $VERSION\n";
+    exit 0;
+}
+usage_exit() if $opt_help;
+
+if (@ARGV != 1) {
+    print STDERR "ltz: expected exactly one input file\n";
+    usage_exit();
+}
+
+my $input_file = $ARGV[0];
+die "ltz: file not found: $input_file\n" unless -f $input_file;
+$input_file = abs_path($input_file);
+
+my ($name, $dir, $ext) = fileparse($input_file, qr/\.[^.]*/);
+$ext = lc($ext);
+
+my $input_type;
+if ($ext eq '.asc') {
+    $input_type = 'asc';
+} elsif ($ext =~ /^\.(cir|net|sp)$/) {
+    $input_type = 'cir';
+} else {
+    die "ltz: unsupported file type '$ext' (expected .asc, .cir, .net, .sp)\n";
+}
+
+# Default to batch mode if neither -b nor -netlist given
+$opt_batch = 1 unless $opt_netlist;
+
+# ---------------------------------------------------------------------------
+# Find Xyce
+# ---------------------------------------------------------------------------
+
+my $XYCE = $ENV{XYCE}
+    || find_in_path('Xyce')
+    || '/usr/local/XyceOpenSource/bin/Xyce';
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+my $tmpdir = tempdir('ltz_XXXX', TMPDIR => 1, CLEANUP => 1);
+
+# Signal handlers for clean shutdown
+$SIG{INT}  = sub { exit 130 };
+$SIG{TERM} = sub { exit 143 };
+
+my $exit_code = run();
+exit($exit_code);
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestrator
+# ---------------------------------------------------------------------------
+
+sub run {
+    my $netlist_file;
+
+    if ($input_type eq 'asc') {
+        verbose("Input type: LTspice schematic (.asc)");
+        my $intermediate = File::Spec->catfile($tmpdir, "${name}.cir");
+        convert_asc_file($input_file, $intermediate);
+        $netlist_file = $intermediate;
+    } else {
+        verbose("Input type: SPICE netlist ($ext)");
+        $netlist_file = $input_file;
+    }
+
+    # Determine output path for converted netlist
+    my $xyce_cir;
+    if ($opt_netlist) {
+        $xyce_cir = $opt_output || File::Spec->catfile($dir, "${name}.xyce.cir");
+    } else {
+        $xyce_cir = File::Spec->catfile($tmpdir, "${name}.xyce.cir");
+    }
+
+    convert_cir_file($netlist_file, $xyce_cir);
+
+    if ($opt_netlist) {
+        print "ltz: wrote netlist: $xyce_cir\n";
+        return 0;
+    }
+
+    # Run Xyce
+    die "ltz: Xyce not found at '$XYCE'. Install Xyce or set XYCE env var.\n"
+        unless -x $XYCE;
+
+    my @xyce_args;
+    push @xyce_args, '-a' if $opt_ascii;
+
+    if ($opt_output) {
+        push @xyce_args, '-o', $opt_output;
+    }
+
+    my @cmd = ($XYCE, @xyce_args, $xyce_cir);
+    verbose("Running: @cmd");
+    system(@cmd);
+    my $rc = $? >> 8;
+    verbose("Xyce exited with code $rc");
+    return $rc;
+}
+
+# ===========================================================================
+#  .cir -> Xyce conversion  (reimplements tools/ltz_convert.py)
+# ===========================================================================
+
+sub convert_cir_file {
+    my ($inpath, $outpath) = @_;
+    verbose("Converting $inpath -> $outpath");
+
+    open my $fh, '<', $inpath or die "ltz: cannot read $inpath: $!\n";
+    my @lines = <$fh>;
+    close $fh;
+
+    # Strip \r for Windows-origin files
+    s/\r\n?/\n/ for @lines;
+
+    my $lib_path = (!$opt_no_lib) ? find_lib_path() : undef;
+    my ($out_ref, $changes_ref, $warnings_ref) = cir_to_xyce(\@lines, $lib_path);
+
+    # Auto-include bundled model library
+    if ($lib_path) {
+        verbose("Including model library: $lib_path");
+        # Insert .INCLUDE after the title line (first line)
+        splice @$out_ref, 1, 0, ".INCLUDE $lib_path\n";
+    }
+
+    my $odir = dirname($outpath);
+    if ($odir && !-d $odir) {
+        require File::Path;
+        File::Path::make_path($odir);
+    }
+
+    open my $ofh, '>', $outpath or die "ltz: cannot write $outpath: $!\n";
+    print $ofh @$out_ref;
+    close $ofh;
+
+    verbose(sprintf "Conversion: %d changes, %d warnings",
+        scalar @$changes_ref, scalar @$warnings_ref);
+    if ($opt_verbose) {
+        for (@$changes_ref)  { verbose("  change: $_") }
+        for (@$warnings_ref) { verbose("  warn:   $_") }
+    }
+}
+
+sub cir_to_xyce {
+    my ($lines_ref, $lib_path) = @_;
+    my @output;
+    my @changes;
+    my @warnings;
+    my $has_end   = 0;
+    my $has_print = 0;
+    my $analysis_type;
+    my %diode_models_used;     # model names referenced by D devices
+    my %models_defined;        # model names defined by .model statements
+
+    # First pass: detect analysis type, track models
+    for my $line (@$lines_ref) {
+        my $u = uc($line);
+        if    ($u =~ /^\s*\.TRAN\b/) { $analysis_type = 'TRAN' }
+        elsif ($u =~ /^\s*\.AC\b/)   { $analysis_type = 'AC' }
+        elsif ($u =~ /^\s*\.DC\b/)   { $analysis_type = 'DC' }
+        elsif ($u =~ /^\s*\.OP\b/)   { $analysis_type = 'DC' }
+        elsif ($u =~ /^\s*\.TF\b/)   { $analysis_type = 'DC' }
+
+        # Track diode instance model references: D<name> <n+> <n-> <model>
+        if ($line =~ /^\s*D\S*\s+\S+\s+\S+\s+(\S+)/i) {
+            $diode_models_used{$1} = 1;
+        }
+        # Track .model definitions
+        if ($line =~ /^\s*\.MODEL\s+(\S+)\s/i) {
+            $models_defined{$1} = 1;
+        }
+    }
+
+    # Second pass: convert
+    my $lineno = 0;
+    for my $line (@$lines_ref) {
+        $lineno++;
+        (my $stripped = $line) =~ s/^\s+|\s+$//g;
+        my $upper = uc($stripped);
+
+        # Preserve empty lines
+        unless (length $stripped) {
+            push @output, $line;
+            next;
+        }
+
+        # .PROBE removal
+        if ($upper eq '.PROBE' || $upper =~ /^\.PROBE\s/) {
+            push @changes, "L$lineno: Removed .PROBE";
+            push @output, "* [ltz] removed: $stripped\n";
+            next;
+        }
+
+        # Bare .PLOT removal
+        if ($upper eq '.PLOT') {
+            push @changes, "L$lineno: Removed bare .PLOT";
+            push @output, "* [ltz] removed: $stripped\n";
+            next;
+        }
+
+        # .BACKANNO removal
+        if ($upper =~ /^\.BACKANNO/) {
+            push @changes, "L$lineno: Removed .BACKANNO";
+            push @output, "* [ltz] removed: $stripped\n";
+            next;
+        }
+
+        # .LIB with Windows paths
+        if ($upper =~ /^\.LIB\b/ && $stripped =~ /\\/) {
+            push @warnings, "L$lineno: Windows .lib path removed: $stripped";
+            push @output, "* [ltz] removed Windows path: $stripped\n";
+            next;
+        }
+
+        # .INCLUDE/.INC handling
+        if ($upper =~ /^\.(?:INCLUDE|INC)\b/) {
+            my ($inc_file) = $stripped =~ /^\S+\s+(.*)/;
+            $inc_file //= '';
+            if ($inc_file =~ /\\/) {
+                push @warnings, "L$lineno: Windows .include path: $stripped";
+                push @output, "* [ltz] removed Windows path: $stripped\n";
+            } else {
+                push @warnings, "L$lineno: .include dependency: $inc_file";
+                push @output, $line;
+            }
+            next;
+        }
+
+        # Empty diode model -> add default params
+        if ($stripped =~ /^\.model\s+(\S+)\s+D\s*$/i) {
+            my $mname = $1;
+            push @warnings, "L$lineno: Empty diode model '$mname' -- Xyce needs parameters";
+            push @changes, "L$lineno: Added default diode params to .model $mname";
+            push @output, ".model $mname D(IS=2.52e-9 RS=0.568 N=1.752 BV=100 IBV=100u)\n";
+            next;
+        }
+
+        # .PLOT with args -> .PRINT
+        if ($stripped =~ /^\.PLOT\s+(.+)/i) {
+            my $args = $1;
+            push @changes, "L$lineno: .PLOT -> .PRINT";
+            push @output, ".PRINT $args\n";
+            $has_print = 1;
+            next;
+        }
+
+        # .meas -> .MEASURE
+        if ($upper =~ /^\.MEAS[\s\t]/) {
+            (my $converted = $stripped) =~ s/^\.meas/.MEASURE/i;
+            $converted =~ s/\bFrom\b/FROM/g;
+            $converted =~ s/\bto\b/TO/g;
+            push @changes, "L$lineno: .meas -> .MEASURE";
+            push @output, "$converted\n";
+            next;
+        }
+
+        # .func: ^ -> **
+        if ($upper =~ /^\.FUNC/) {
+            if ($stripped =~ /\^/) {
+                (my $converted = $stripped) =~ s/\^/**/g;
+                push @changes, "L$lineno: Replaced ^ with ** in .func";
+                push @output, "$converted\n";
+            } else {
+                push @output, $line;
+            }
+            next;
+        }
+
+        # .tran: LTspice allows single-arg ".tran <Tstop>", Xyce needs ".TRAN <Tstep> <Tstop>"
+        # Also handles .tran 0 <tstop> ... where step=0 means "auto" in LTspice
+        # Also handles trailing "uic" keyword and "startup" keyword
+        if ($upper =~ /^\.TRAN\s/) {
+            # Strip trailing UIC/startup keywords (Xyce uses .IC separately)
+            my $tran_line = $stripped;
+            my $has_uic = ($tran_line =~ s/\s+(?:uic|startup)\s*$//i);
+            my @fields = split /\s+/, $tran_line;
+            if (@fields == 2) {
+                # Single arg: .tran <Tstop> -> .TRAN <Tstop/1000> <Tstop>
+                my $tstop = $fields[1];
+                my $tstop_val = _parse_eng($tstop);
+                if (defined $tstop_val && $tstop_val > 0) {
+                    my $tstep = $tstop_val / 1000;
+                    push @changes, "L$lineno: .tran $tstop -> .TRAN $tstep $tstop (added step size)";
+                    push @output, ".TRAN $tstep $tstop\n";
+                } else {
+                    push @output, "$tran_line\n";
+                }
+            } elsif (@fields >= 3) {
+                # Multi-arg: .tran <tstep> <tstop> [tstart] [tmax]
+                # If tstep is 0, auto-calculate from tstop
+                my $tstep_val = _parse_eng($fields[1]);
+                my $tstop_val = _parse_eng($fields[2]);
+                if (defined $tstep_val && $tstep_val == 0 && defined $tstop_val && $tstop_val > 0) {
+                    my $new_tstep = $tstop_val / 1000;
+                    my $new_line = ".TRAN $new_tstep $fields[2]";
+                    push @changes, "L$lineno: .tran step=0 -> .TRAN step=$new_tstep";
+                    push @output, "$new_line\n";
+                } else {
+                    push @output, "$tran_line\n";
+                }
+            } else {
+                push @output, "$tran_line\n";
+            }
+            push @changes, "L$lineno: Removed UIC keyword" if $has_uic;
+            next;
+        }
+
+        # Track .PRINT
+        if ($upper =~ /^\.PRINT/) {
+            $has_print = 1;
+            push @output, $line;
+            next;
+        }
+
+        # Track .END
+        if ($upper eq '.END') {
+            $has_end = 1;
+            push @output, $line;
+            next;
+        }
+
+        # --- Non-exclusive pre-processing (modifies $stripped in-place) ---
+        my $modified = 0;
+
+        # Strip Rser= inline parameter on source lines (LTspice-specific)
+        if ($stripped =~ /^[VI]\S*\s/i && $stripped =~ /\bRser=/i) {
+            $stripped =~ s/\s+Rser=\S+//ig;
+            push @changes, "L$lineno: Stripped Rser= from source";
+            $modified = 1;
+        }
+
+        # British notation: 4n7 -> 4.7n, 2k2 -> 2.2k, 1u5 -> 1.5u etc.
+        if ($stripped =~ s/\b(\d+)([pnumkMG])(\d+)\b/$1.$3$2/g) {
+            push @changes, "L$lineno: British notation -> decimal";
+            $modified = 1;
+        }
+
+        # --- Exclusive transformations (with next) ---
+
+        # ; line comments -> * comments
+        if ($stripped =~ /^;(.*)/) {
+            push @changes, "L$lineno: ; comment -> * comment";
+            push @output, "* $1\n";
+            next;
+        }
+
+        # SINE( -> SIN( (LTspice uses SINE, standard SPICE/Xyce uses SIN)
+        if ($stripped =~ /\bSINE\s*\(/i) {
+            (my $converted = $stripped) =~ s/\bSINE\s*\(/SIN(/ig;
+            push @changes, "L$lineno: SINE( -> SIN(";
+            push @output, "$converted\n";
+            next;
+        }
+
+        # µ (micro sign) -> u (ASCII) for engineering notation
+        # Handle both Latin-1 (0xB5) and UTF-8 (0xC2 0xB5) encodings
+        if ($stripped =~ /\xb5|\xc2\xb5/) {
+            (my $converted = $stripped) =~ s/\xc2\xb5/u/g;
+            $converted =~ s/\xb5/u/g;
+            push @changes, "L$lineno: µ -> u";
+            push @output, "$converted\n";
+            next;
+        }
+
+        # Pass-through
+        push @output, $modified ? "$stripped\n" : $line;
+    }
+
+    # Post-processing
+    if (!$has_print && $analysis_type) {
+        push @warnings,
+            "No .PRINT statement -- Xyce needs explicit output specification";
+    }
+    # Add generic .model for diodes with no model definition
+    # Skip if bundled library is being included (it provides standard models)
+    my @missing_models;
+    if (!$lib_path) {
+        for my $mname (sort keys %diode_models_used) {
+            next if $models_defined{$mname};
+            next if $mname =~ /^D$/i;
+            next if $mname =~ /^\{/;
+            push @missing_models, $mname;
+        }
+    }
+    if (@missing_models) {
+        # Insert before .END
+        my @pre_end;
+        my $end_line;
+        if ($has_end) {
+            $end_line = pop @output;  # remove .END temporarily
+        }
+        for my $mname (@missing_models) {
+            push @pre_end, "* [ltz] auto-generated model for $mname\n";
+            push @pre_end, ".model $mname D(IS=2.52e-9 RS=0.568 N=1.752 BV=100 IBV=100u)\n";
+            push @changes, "Added generic .model for diode $mname";
+        }
+        push @output, @pre_end;
+        push @output, $end_line if defined $end_line;
+    }
+
+    if (!$has_end) {
+        push @output, ".END\n";
+        push @changes, "Added missing .END";
+    }
+
+    return (\@output, \@changes, \@warnings);
+}
+
+# ===========================================================================
+#  .asc -> netlist conversion  (LTspice schematic parser)
+# ===========================================================================
+
+# (Symbol pin table is at top of file with globals)
+
+sub convert_asc_file {
+    my ($inpath, $outpath) = @_;
+    verbose("Parsing .asc: $inpath");
+
+    open my $fh, '<', $inpath or die "ltz: cannot read $inpath: $!\n";
+    my @lines = <$fh>;
+    close $fh;
+    s/\r\n?/\n/ for @lines;
+
+    my $netlist_ref = asc_to_netlist(\@lines);
+
+    my $odir = dirname($outpath);
+    if ($odir && !-d $odir) {
+        require File::Path;
+        File::Path::make_path($odir);
+    }
+
+    open my $ofh, '>', $outpath or die "ltz: cannot write $outpath: $!\n";
+    print $ofh @$netlist_ref;
+    close $ofh;
+
+    verbose("Wrote intermediate netlist: $outpath");
+}
+
+sub asc_to_netlist {
+    my ($lines_ref) = @_;
+
+    # --- Parse phase ---
+    my @wires;       # [[x1,y1,x2,y2], ...]
+    my @symbols;     # [{type, x, y, rot, attrs=>{}}, ...]
+    my @flags;       # [{x, y, label}, ...]
+    my @directives;  # SPICE directive strings
+    my @comments;    # plain text comments
+    my $cur_sym;     # symbol being built
+
+    for my $line (@$lines_ref) {
+        chomp $line;
+
+        if ($line =~ /^WIRE\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)/) {
+            push @wires, [$1, $2, $3, $4];
+            next;
+        }
+
+        if ($line =~ /^FLAG\s+(-?\d+)\s+(-?\d+)\s+(\S+)/) {
+            push @flags, { x => $1, y => $2, label => $3 };
+            next;
+        }
+
+        if ($line =~ /^SYMBOL\s+(\S+)\s+(-?\d+)\s+(-?\d+)\s+(R\d+|M\d+)/) {
+            # Finish previous symbol
+            push @symbols, $cur_sym if $cur_sym;
+            $cur_sym = {
+                type  => $1,
+                x     => $2,
+                y     => $3,
+                rot   => $4,
+                attrs => {},
+            };
+            next;
+        }
+
+        if ($line =~ /^SYMATTR\s+(\S+)\s*(.*)/) {
+            if ($cur_sym) {
+                $cur_sym->{attrs}{$1} = $2;
+            }
+            next;
+        }
+
+        # TEXT lines: directives start with !, comments start with ;
+        if ($line =~ /^TEXT\s+-?\d+\s+-?\d+\s+\S+\s+\d+\s+(!.*)/) {
+            my $text = $1;
+            $text =~ s/^!//;
+            # Handle multi-line directives (LTspice uses \n literal)
+            my @parts = split /\\n\s*/, $text;
+            for my $part (@parts) {
+                $part =~ s/^\s+|\s+$//g;
+                push @directives, $part if length $part;
+            }
+            next;
+        }
+        if ($line =~ /^TEXT\s+-?\d+\s+-?\d+\s+\S+\s+\d+\s+;(.*)/) {
+            push @comments, $1;
+            next;
+        }
+    }
+    push @symbols, $cur_sym if $cur_sym;
+
+    verbose(sprintf "  Parsed: %d wires, %d symbols, %d flags, %d directives",
+        scalar @wires, scalar @symbols, scalar @flags, scalar @directives);
+
+    # --- Build net connectivity via union-find on coordinates ---
+    # Points connect if they share coordinates (wire endpoints, flags, pins).
+    # A point also connects to a wire if it lies ON the wire segment.
+
+    my %parent;  # "x,y" => "x,y"
+
+    my $find; $find = sub {
+        my ($k) = @_;
+        return $k unless exists $parent{$k};
+        if ($parent{$k} ne $k) {
+            $parent{$k} = $find->($parent{$k});
+        }
+        return $parent{$k};
+    };
+
+    my $union = sub {
+        my ($a, $b) = @_;
+        $parent{$a} //= $a;
+        $parent{$b} //= $b;
+        my $ra = $find->($a);
+        my $rb = $find->($b);
+        $parent{$ra} = $rb if $ra ne $rb;
+    };
+
+    # Add wire endpoints and connect each wire's two endpoints
+    for my $w (@wires) {
+        my $a = _uf_key($w->[0], $w->[1]);
+        my $b = _uf_key($w->[2], $w->[3]);
+        $parent{$a} //= $a;
+        $parent{$b} //= $b;
+        $union->($a, $b);
+    }
+
+    # Helper: connect a point to any wire segment it lies on
+    my $connect_point_to_wires = sub {
+        my ($px, $py) = @_;
+        my $pk = _uf_key($px, $py);
+        $parent{$pk} //= $pk;
+        for my $w (@wires) {
+            my ($x1,$y1,$x2,$y2) = @$w;
+            my $on = 0;
+            if ($x1 == $x2 && $px == $x1) {    # vertical wire
+                my ($lo,$hi) = $y1 < $y2 ? ($y1,$y2) : ($y2,$y1);
+                $on = 1 if $py >= $lo && $py <= $hi;
+            } elsif ($y1 == $y2 && $py == $y1) {  # horizontal wire
+                my ($lo,$hi) = $x1 < $x2 ? ($x1,$x2) : ($x2,$x1);
+                $on = 1 if $px >= $lo && $px <= $hi;
+            }
+            if ($on) {
+                $union->($pk, _uf_key($x1, $y1));
+                last;
+            }
+        }
+    };
+
+    # Connect FLAGs to wire network (flags may land on wire midpoints)
+    for my $f (@flags) {
+        $connect_point_to_wires->($f->{x}, $f->{y});
+    }
+
+    # --- Assign net names ---
+    my %net_name;
+    for my $f (@flags) {
+        my $k = _uf_key($f->{x}, $f->{y});
+        $parent{$k} //= $k;
+        my $root = $find->($k);
+        $net_name{$root} = $f->{label};
+    }
+
+    my $net_counter = 1;
+    my $get_net_name = sub {
+        my ($x, $y) = @_;
+        # First ensure this point is connected to any wire it touches
+        $connect_point_to_wires->($x, $y);
+        my $k = _uf_key($x, $y);
+        my $root = $find->($k);
+        unless (exists $net_name{$root}) {
+            $net_name{$root} = sprintf "N%03d", $net_counter++;
+        }
+        return $net_name{$root};
+    };
+
+    # --- Apply rotation transforms to symbol pins ---
+    # Rotations: R0=0, R90=90, R180=180, R270=270
+    # Mirrors:   M0=mirror-X+R0, M90=mirror-X+R90, etc.
+
+    my $transform_pin = sub {
+        my ($dx, $dy, $rot_str) = @_;
+        my $mirror = ($rot_str =~ /^M/);
+        my ($angle) = $rot_str =~ /(\d+)/;
+        $angle //= 0;
+
+        # Mirror across X axis first (negate dx)
+        $dx = -$dx if $mirror;
+
+        # Rotate
+        my ($nx, $ny);
+        if ($angle == 0) {
+            ($nx, $ny) = ($dx, $dy);
+        } elsif ($angle == 90) {
+            ($nx, $ny) = (-$dy, $dx);
+        } elsif ($angle == 180) {
+            ($nx, $ny) = (-$dx, -$dy);
+        } elsif ($angle == 270) {
+            ($nx, $ny) = ($dy, -$dx);
+        } else {
+            ($nx, $ny) = ($dx, $dy);
+        }
+        return ($nx, $ny);
+    };
+
+    # --- Generate netlist lines ---
+    my @netlist;
+    my %default_models_needed;  # track which default models we auto-generated
+    push @netlist, "* Netlist generated by ltz from .asc\n";
+
+    # Emit component instances
+    for my $sym (@symbols) {
+        my $type_key = lc($sym->{type});
+        # Strip path separators for symbols like "Misc/LED"
+        $type_key = (split /[\/\\]/, $type_key)[-1];
+
+        my $info = $SYMBOL_PINS{$type_key};
+        my $inst_name = $sym->{attrs}{InstName} // '';
+        my $value     = $sym->{attrs}{Value}    // '';
+        my $model     = $sym->{attrs}{Value2}   // '';
+        my $spiceline = $sym->{attrs}{SpiceLine} // '';
+        my $spiceline2= $sym->{attrs}{SpiceLine2} // '';
+
+        unless ($info) {
+            # Unknown symbol -- emit as subcircuit call or comment
+            verbose("  Unknown symbol type: $sym->{type} ($inst_name)");
+            # Try to resolve pins by checking which wire endpoints are near
+            # For now, emit as a comment
+            push @netlist, "* [ltz] unknown symbol: $sym->{type} $inst_name\n";
+            next;
+        }
+
+        # Calculate absolute pin positions
+        my @nets;
+        for my $pin_offset (@{$info->{pins}}) {
+            my ($dx, $dy) = @$pin_offset;
+            my ($tdx, $tdy) = $transform_pin->($dx, $dy, $sym->{rot});
+            my $px = $sym->{x} + $tdx;
+            my $py = $sym->{y} + $tdy;
+            push @nets, $get_net_name->($px, $py);
+        }
+
+        # Build SPICE line
+        my $prefix = $info->{prefix};
+        # Use InstName if it already has the right prefix, otherwise prepend
+        my $spice_name;
+        if ($inst_name =~ /^$prefix/i) {
+            $spice_name = $inst_name;
+        } elsif (length $inst_name) {
+            $spice_name = $inst_name;
+        } else {
+            $spice_name = $prefix . '_unnamed';
+        }
+
+        my $nets_str = join(' ', @nets);
+
+        if ($prefix eq 'R' || $prefix eq 'C' || $prefix eq 'L') {
+            # Passive: NAME n+ n- value
+            push @netlist, "$spice_name $nets_str $value\n";
+        } elsif ($prefix eq 'D') {
+            # Diode: NAME anode cathode model
+            push @netlist, "$spice_name $nets_str $value\n";
+        } elsif ($prefix eq 'V' || $prefix eq 'I') {
+            # Source: NAME n+ n- value
+            my $src_spec = $value;
+            $src_spec .= " $spiceline" if length $spiceline;
+            push @netlist, "$spice_name $nets_str $src_spec\n";
+        } elsif ($prefix eq 'Q') {
+            # BJT: NAME C B E model
+            my $qmodel = $value;
+            if (!length $qmodel) {
+                $qmodel = ($type_key =~ /pnp/) ? 'PNP_DEFAULT' : 'NPN_DEFAULT';
+                $default_models_needed{$qmodel} = 1;
+            }
+            push @netlist, "$spice_name $nets_str $qmodel\n";
+        } elsif ($prefix eq 'M') {
+            # MOSFET: NAME D G S [B] model
+            my $mmodel = $value;
+            if (!length $mmodel) {
+                $mmodel = ($type_key =~ /pmos/) ? 'PMOS_DEFAULT' : 'NMOS_DEFAULT';
+                $default_models_needed{$mmodel} = 1;
+            }
+            my $extra = '';
+            $extra .= " $spiceline" if length $spiceline;
+            push @netlist, "$spice_name $nets_str $mmodel$extra\n";
+        } elsif ($prefix eq 'X') {
+            # Subcircuit (opamp etc.): X<name> <nodes> <model>
+            # Model name comes from Value attr or the symbol type name
+            my $subckt_model = $value;
+            if (!length $subckt_model) {
+                # Use the symbol type name (e.g., OP07 from OpAmps\\OP07)
+                $subckt_model = uc((split /[\/\\]/, $sym->{type})[-1]);
+            }
+            # Ensure name starts with X
+            my $xname = $spice_name;
+            $xname = "X$xname" unless $xname =~ /^X/i;
+            push @netlist, "$xname $nets_str $subckt_model\n";
+        } else {
+            push @netlist, "$spice_name $nets_str $value\n";
+        }
+
+        # Append SpiceLine as a comment if it contains non-model info
+        if ($prefix =~ /^[RCL]$/ && length $spiceline) {
+            push @netlist, "* SpiceLine: $spiceline\n";
+        }
+    }
+
+    # Emit default model cards for devices with no model specified
+    # Skip if bundled library is available (it already defines these defaults)
+    my $lib_path = (!$opt_no_lib) ? find_lib_path() : undef;
+    %default_models_needed = () if $lib_path;
+    if (%default_models_needed) {
+        push @netlist, "\n";
+        if ($default_models_needed{NMOS_DEFAULT}) {
+            push @netlist, "* [ltz] auto-generated default NMOS model\n";
+            push @netlist, ".model NMOS_DEFAULT NMOS (LEVEL=1 VTO=0.7 KP=110u)\n";
+        }
+        if ($default_models_needed{PMOS_DEFAULT}) {
+            push @netlist, "* [ltz] auto-generated default PMOS model\n";
+            push @netlist, ".model PMOS_DEFAULT PMOS (LEVEL=1 VTO=-0.7 KP=60u)\n";
+        }
+        if ($default_models_needed{NPN_DEFAULT}) {
+            push @netlist, "* [ltz] auto-generated default NPN model\n";
+            push @netlist, ".model NPN_DEFAULT NPN (BF=100 IS=1e-14)\n";
+        }
+        if ($default_models_needed{PNP_DEFAULT}) {
+            push @netlist, "* [ltz] auto-generated default PNP model\n";
+            push @netlist, ".model PNP_DEFAULT PNP (BF=100 IS=1e-14)\n";
+        }
+    }
+
+    # Emit directives
+    push @netlist, "\n" if @directives;
+    for my $d (@directives) {
+        push @netlist, "$d\n";
+    }
+
+    # Ensure .END
+    my $has_end = grep { /^\s*\.END\s*$/i } @directives;
+    push @netlist, ".END\n" unless $has_end;
+
+    return \@netlist;
+}
+
+# ===========================================================================
+#  Utilities
+# ===========================================================================
+
+sub _uf_key { "$_[0],$_[1]" }
+
+# Parse engineering notation: 10ms -> 0.01, 100u -> 0.0001, 5k -> 5000, etc.
+sub _parse_eng {
+    my ($s) = @_;
+    my %suffix = (
+        t => 1e12, g => 1e9, meg => 1e6, k => 1e3,
+        m => 1e-3, u => 1e-6, n => 1e-9, p => 1e-12, f => 1e-15,
+        mil => 25.4e-6,
+    );
+    if ($s =~ /^([+-]?[\d.]+(?:e[+-]?\d+)?)\s*(meg|mil|[tgkmunpf])?(?:[a-z]*)?$/i) {
+        my ($num, $suf) = ($1, $2);
+        return $num unless defined $suf;
+        my $mult = $suffix{lc $suf};
+        return defined $mult ? $num * $mult : $num;
+    }
+    # Plain number
+    return $s if $s =~ /^[+-]?[\d.]+(?:e[+-]?\d+)?$/i;
+    return undef;
+}
+
+sub find_lib_path {
+    # Locate the bundled standard.lib model library
+    # Check: $LTZ_LIB env, script/../lib/, /usr/local/share/ltz/lib/
+    my @search = (
+        $ENV{LTZ_LIB},
+        File::Spec->catfile($REPO_ROOT, 'lib', 'standard.lib'),
+        '/usr/local/share/ltz/lib/standard.lib',
+    );
+    for my $p (@search) {
+        next unless defined $p && -f $p;
+        return abs_path($p);
+    }
+    return undef;
+}
+
+sub find_in_path {
+    my ($cmd) = @_;
+    for my $dir (split /:/, $ENV{PATH} // '') {
+        my $full = File::Spec->catfile($dir, $cmd);
+        return $full if -x $full;
+    }
+    return undef;
+}
+
+sub verbose {
+    return unless $opt_verbose;
+    print STDERR "ltz: $_[0]\n";
+}
+
+sub usage_exit {
+    print STDERR <<'USAGE';
+ltz - LTspice-compatible CLI wrapper for Xyce simulation
+
+Usage: ltz [options] <circuit_file>
+
+Options:
+  -b              Batch mode: convert and simulate (default)
+  -netlist        Convert to Xyce netlist only (no simulation)
+  -o FILE         Output file path
+  -ascii          Force ASCII output from Xyce
+  --no-lib        Don't auto-include bundled model library
+  -v, --verbose   Show pipeline details
+  -h, --help      Show this help
+  --version       Show version
+
+Supported input formats:
+  .asc            LTspice schematic (parsed natively in Perl)
+  .cir, .net, .sp SPICE netlist
+
+Environment variables:
+  XYCE            Path to Xyce executable
+                  Default: /usr/local/XyceOpenSource/bin/Xyce or search PATH
+  LTZ_LIB         Path to custom model library file
+
+Examples:
+  ltz -b amplifier.cir                # simulate with Xyce
+  ltz -netlist design.asc             # export Xyce-compatible netlist
+  ltz -b -ascii -o results test.cir   # ASCII output, custom path
+  ltz -b -v circuit.asc               # verbose pipeline trace
+
+Output:
+  Xyce writes .prn files (tabular text), not LTspice .raw format.
+  Use -o to control output basename.
+USAGE
+    exit 1;
+}

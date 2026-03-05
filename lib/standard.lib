@@ -1,0 +1,189 @@
+* ltz standard SPICE model library
+* Bundled models for common components used in LTspice circuits.
+* Models sourced from manufacturer datasheets and published SPICE libraries.
+*
+* Usage: .INCLUDE /path/to/standard.lib
+* (auto-included by bin/ltz unless --no-lib is specified)
+
+*===========================================================================
+* DIODES
+*===========================================================================
+
+* 1N4148 - Silicon signal diode (OnSemi/LTspice standard.dio)
+.model 1N4148 D(Is=2.52n Rs=.568 N=1.752 Cjo=4p M=.4 tt=20n BV=100 IBV=100u)
+
+* 1N4007 - Silicon rectifier 1000V (OnSemi)
+.model 1N4007 D(IS=7.02767n RS=0.0341512 N=1.80803 EG=1.05743
++ XTI=5 BV=1000 IBV=5e-08 CJO=1e-11 VJ=0.7 M=0.5 FC=0.5 TT=1e-07)
+
+* 1N5817 - Schottky diode 20V 1A (OnSemi)
+.model 1N5817 D(Is=31.7u Rs=.051 N=1.373 Cjo=190p M=.3
++ Eg=.69 Xti=2 BV=20 IBV=1m)
+
+* 1N5373B - Zener diode 56V (generic)
+.model 1N5373B D(Is=2.52n Rs=.568 N=1.752 BV=56 IBV=5u Cjo=50p)
+
+* 1N746 - Zener 3.3V
+.model 1N746 D(Is=2.52n Rs=.568 N=1.752 BV=3.3 IBV=5u Cjo=50p)
+
+* 1N749 - Zener 4.3V
+.model 1N749 D(Is=2.52n Rs=.568 N=1.752 BV=4.3 IBV=5u Cjo=50p)
+
+* 1N752 - Zener 5.6V
+.model 1N752 D(Is=2.52n Rs=.568 N=1.752 BV=5.6 IBV=5u Cjo=50p)
+
+* 1N755 - Zener 7.5V
+.model 1N755 D(Is=2.52n Rs=.568 N=1.752 BV=7.5 IBV=5u Cjo=50p)
+
+* 1N757 - Zener 9.1V
+.model 1N757 D(Is=2.52n Rs=.568 N=1.752 BV=9.1 IBV=5u Cjo=50p)
+
+* 1N758 - Zener 10V
+.model 1N758 D(Is=2.52n Rs=.568 N=1.752 BV=10 IBV=5u Cjo=50p)
+
+* 1N759 - Zener 12V
+.model 1N759 D(Is=2.52n Rs=.568 N=1.752 BV=12 IBV=5u Cjo=50p)
+
+* D1N4148 - Alias often used in LTspice
+.model D1N4148 D(Is=2.52n Rs=.568 N=1.752 Cjo=4p M=.4 tt=20n BV=100 IBV=100u)
+
+*===========================================================================
+* BIPOLAR JUNCTION TRANSISTORS
+*===========================================================================
+
+* 2N2222 - NPN general purpose (Philips/generic)
+.model 2N2222 NPN(IS=1E-14 VAF=100 BF=200 IKF=0.3 XTB=1.5 BR=3
++ CJC=8E-12 CJE=25E-12 TR=100E-9 TF=400E-12
++ ITF=1 VTF=2 XTF=3 RB=10 RC=.3 RE=.2)
+
+* 2N3904 - NPN small signal (Fairchild datasheet)
+.model 2N3904 NPN(IS=6.734f Xti=3 Eg=1.11 Vaf=74.03 Bf=416.4
++ Ne=1.259 Ise=6.734f Ikf=66.78m Xtb=1.5
++ Br=.7371 Nc=2 Isc=0 Ikr=0 Rc=1
++ Cjc=3.638p Mjc=.3085 Vjc=.75 Fc=.5
++ Cje=4.493p Mje=.2593 Vje=.75
++ Tr=239.5n Tf=301.2p Itf=.4 Vtf=4 Xtf=2 Rb=10)
+
+* 2N3906 - PNP small signal (Fairchild datasheet)
+.model 2N3906 PNP(IS=1.41f Xti=3 Eg=1.11 Vaf=18.7 Bf=180.7
++ Ne=1.5 Ise=0 Ikf=80m Xtb=1.5
++ Br=4.977 Nc=2 Isc=0 Ikr=0 Rc=2.5
++ Cjc=9.728p Mjc=.5776 Vjc=.75 Fc=.5
++ Cje=8.063p Mje=.3677 Vje=.75
++ Tr=33.42n Tf=179.3p Itf=.4 Vtf=4)
+
+* 2N2907 - PNP general purpose (generic, similar to 2N3906)
+.model 2N2907 PNP(IS=1.41f Xti=3 Eg=1.11 Vaf=18.7 Bf=180.7
++ Ne=1.5 Ise=0 Ikf=80m Xtb=1.5
++ Br=4.977 Nc=2 Isc=0 Ikr=0 Rc=2.5
++ Cjc=9.728p Mjc=.5776 Vjc=.75 Fc=.5
++ Cje=8.063p Mje=.3677 Vje=.75
++ Tr=33.42n Tf=179.3p Itf=.4 Vtf=4)
+
+* NPN_DEFAULT - Generic NPN fallback for symbols with no model specified
+.model NPN_DEFAULT NPN(BF=100 IS=1e-14 VAF=100 CJC=5p CJE=10p)
+
+* PNP_DEFAULT - Generic PNP fallback for symbols with no model specified
+.model PNP_DEFAULT PNP(BF=100 IS=1e-14 VAF=100 CJC=5p CJE=10p)
+
+*===========================================================================
+* MOSFETS
+*===========================================================================
+
+* 2N7000 - NMOS enhancement 60V (OnSemi, simplified)
+.model 2N7000 NMOS(LEVEL=1 VTO=2.236 KP=0.0932174 LAMBDA=0.01
++ CGSO=1.79115e-07 CGDO=1.0724e-11 IS=1e-32)
+
+* BS250 - PMOS enhancement -45V (generic)
+.model BS250 PMOS(LEVEL=1 VTO=-3.0 KP=0.05 LAMBDA=0.01
++ CGSO=1e-07 CGDO=1e-11)
+
+* BSP89 - NMOS enhancement 240V 0.35A (Philips/NXP, simplified)
+.model BSP89 NMOS(LEVEL=1 VTO=1.5 KP=0.05 LAMBDA=0.01
++ CGSO=1e-08 CGDO=1e-11 IS=1e-32)
+
+* NMOS_DEFAULT - Generic NMOS fallback
+.model NMOS_DEFAULT NMOS(LEVEL=1 VTO=0.7 KP=110u LAMBDA=0.04)
+
+* PMOS_DEFAULT - Generic PMOS fallback
+.model PMOS_DEFAULT PMOS(LEVEL=1 VTO=-0.7 KP=60u LAMBDA=0.04)
+
+*===========================================================================
+* OPERATIONAL AMPLIFIER SUBCIRCUITS
+*===========================================================================
+
+* LM741 / uA741 - Classic opamp macromodel (Boyle topology)
+* Pins: 1=In+  2=In-  3=V+  4=V-  5=Out
+.SUBCKT LM741 1 2 3 4 5
+C1  11 12 8.661E-12
+C2   6  7 30.00E-12
+DC   5 53 DX741
+DE  54  5 DX741
+DLP 90 91 DX741
+DLN 92 90 DX741
+DP   4  3 DX741
+EGND 99 0 POLY(2) 3 0 4 0 0 .5 .5
+FB   7 99 POLY(5) VB VC VE VLP VLN 0 10.61E6 -1E3 1E3 10E6 -10E6
+GA   6  0 11 12 188.5E-6
+GCM  0  6 10 99 5.961E-9
+IEE 10  4 DC 15.16E-6
+HLIM 90  0 VLIM 1K
+Q1  11  2 13 QX741
+Q2  12  1 14 QX741
+R2   6  9 100.0E3
+RC1  3 11 5.305E3
+RC2  3 12 5.305E3
+RE1 13 10 1.836E3
+RE2 14 10 1.836E3
+REE 10 99 13.19E6
+RO1  8  5 50
+RO2  7 99 100
+RP   3  4 18.16E3
+VB   9  0 DC 0
+VC   3 53 DC 1
+VE  54  4 DC 1
+VLIM 7  8 DC 0
+VLP 91  0 DC 40
+VLN  0 92 DC 40
+.MODEL DX741 D(IS=800.0E-18 RS=1)
+.MODEL QX741 NPN(IS=800.0E-18 BF=93.75)
+.ENDS LM741
+
+* OP07 - Precision opamp (simplified Boyle macromodel)
+* Pins: 1=In+  2=In-  3=V+  4=V-  5=Out
+* Based on LM741 topology with OP07-specific parameters:
+*   Vos=75uV, Ib=3nA, Ios=0.8nA, CMRR=110dB, Avol=500k, GBW=600kHz
+.SUBCKT OP07 1 2 3 4 5
+C1  11 12 5.544E-12
+C2   6  7 20.00E-12
+DC   5 53 DX_OP07
+DE  54  5 DX_OP07
+DLP 90 91 DX_OP07
+DLN 92 90 DX_OP07
+DP   4  3 DX_OP07
+EGND 99 0 POLY(2) 3 0 4 0 0 .5 .5
+FB   7 99 POLY(5) VB VC VE VLP VLN 0 15.92E6 -1E3 1E3 15.92E6 -15.92E6
+GA   6  0 11 12 125.7E-6
+GCM  0  6 10 99 3.975E-10
+IEE 10  4 DC 10.04E-6
+HLIM 90  0 VLIM 1K
+Q1  11  2 13 QX_OP07
+Q2  12  1 14 QX_OP07
+R2   6  9 100.0E3
+RC1  3 11 7.958E3
+RC2  3 12 7.958E3
+RE1 13 10 2.773E3
+RE2 14 10 2.773E3
+REE 10 99 19.92E6
+RO1  8  5 25
+RO2  7 99 50
+RP   3  4 30.31E3
+VB   9  0 DC 0
+VC   3 53 DC 1.5
+VE  54  4 DC 1.5
+VLIM 7  8 DC 0
+VLP 91  0 DC 30
+VLN  0 92 DC 30
+.MODEL DX_OP07 D(IS=800.0E-18 RS=1)
+.MODEL QX_OP07 NPN(IS=800.0E-18 BF=250)
+.ENDS OP07
