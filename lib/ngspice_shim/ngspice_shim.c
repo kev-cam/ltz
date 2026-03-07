@@ -516,6 +516,10 @@ static void *sim_thread_func(void *arg)
     }
 
     /* Run the full simulation — Xyce accumulates CSV data in mem:// buffer */
+    if (!xyce_initialized) {
+        send_msg("stderr Error: no circuit loaded\n");
+        goto done;
+    }
     xyce_runSimulation(&xyce_ptr);
 
     /* Read all data from the mem:// buffer */
@@ -623,6 +627,12 @@ int ngSpice_Circ(char **circarray)
 
     sim_type_t st = detect_sim_type(stored_netlist);
 
+    /* Skip trivial/empty circuits (KiCad sends [*, .end] on startup) */
+    if (st == SIM_UNKNOWN) {
+        send_msg("stdout Circuit stored (no analysis yet)\n");
+        return 0;
+    }
+
     /* Inject FILE=mem:// FORMAT=CSV into .PRINT lines */
     char *nl = inject_mem_print(stored_netlist, st);
     free(stored_netlist);
@@ -647,6 +657,10 @@ int ngSpice_Circ(char **circarray)
 
     if (rc != 1) {
         send_msg("stderr Error: Xyce failed to initialize circuit\n");
+        /* Xyce is in bad state after failed init — tear it down */
+        xyce_close(&xyce_ptr);
+        xyce_ptr = NULL;
+        xyce_initialized = false;
         return 1;
     }
 
@@ -693,8 +707,9 @@ int ngSpice_Command(char *command)
     }
 
     if (strcmp(command, "reset") == 0) {
-        /* Reset — reload the circuit */
-        if (stored_netlist && xyce_initialized) {
+        /* Reset — reload the circuit if we have a real one */
+        if (stored_netlist && xyce_initialized &&
+            detect_sim_type(stored_netlist) != SIM_UNKNOWN) {
             xyce_close(&xyce_ptr);
             xyce_ptr = NULL;
             xyce_initialized = false;
@@ -704,7 +719,11 @@ int ngSpice_Command(char *command)
             const char *tmpf = write_netlist_tmpfile(stored_netlist);
             if (tmpf) {
                 char *argv[] = { "Xyce", "-quiet", (char *)tmpf };
-                xyce_initialize(&xyce_ptr, 3, argv);
+                if (xyce_initialize(&xyce_ptr, 3, argv) != 1) {
+                    xyce_close(&xyce_ptr);
+                    xyce_ptr = NULL;
+                    xyce_initialized = false;
+                }
             }
         }
         return 0;

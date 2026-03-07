@@ -1,0 +1,11 @@
+* Two-stage RC low-pass filter
+* Demonstrates ltz ngspice shim driving Xyce
+*
+V1 in 0 SIN(0 3.3 10k)
+R1 in mid 470
+C1 mid 0 10n
+R2 mid out 470
+C2 out 0 10n
+.TRAN 0.5u 500u
+.PRINT TRAN V(in) V(mid) V(out)
+.END

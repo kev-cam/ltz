@@ -1,0 +1,68 @@
+#!/bin/bash
+#
+# ltz-kicad — Launch KiCad with Xyce as the simulation backend
+#
+# Replaces libngspice.so with the ltz shim that routes all simulation
+# through Xyce.  Everything else in KiCad works normally.
+#
+# Usage:
+#   ltz-kicad                    # launch KiCad
+#   ltz-kicad myproject.kicad_pro  # open a project
+#   ltz-kicad --eeschema file.kicad_sch  # open eeschema directly
+#
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LTZ_ROOT="$(dirname "$SCRIPT_DIR")"
+SHIM_DIR="$LTZ_ROOT/lib/ngspice_shim"
+
+# Xyce shared libraries
+XYCE_BUILD="${XYCE_BUILD:-/usr/local/src/xyce-build}"
+XYCE_LIB="$XYCE_BUILD/src"
+XYCE_CINT="$XYCE_BUILD/utils/XyceCInterface"
+
+# Check shim exists
+if [ ! -f "$SHIM_DIR/libngspice.so.0" ]; then
+    echo "Error: ngspice shim not built. Run: make -C $SHIM_DIR" >&2
+    exit 1
+fi
+
+# Check Xyce libs exist
+if [ ! -f "$XYCE_LIB/libxyce.so" ]; then
+    echo "Error: libxyce.so not found at $XYCE_LIB" >&2
+    echo "Set XYCE_BUILD to your Xyce build directory." >&2
+    exit 1
+fi
+
+# LD_PRELOAD forces our shim to be loaded before the system libngspice.
+# KiCad's dlopen("libngspice.so.0") will find our symbols already present.
+export LD_PRELOAD="$SHIM_DIR/libngspice.so.0.0.0${LD_PRELOAD:+ $LD_PRELOAD}"
+export LD_LIBRARY_PATH="$XYCE_LIB:$XYCE_CINT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Parse args
+CMD=kicad
+case "$1" in
+    --eeschema|-e)
+        CMD=eeschema
+        shift
+        ;;
+    --help|-h)
+        cat <<EOF
+Usage: ltz-kicad [options] [project/schematic]
+
+Launch KiCad with Xyce as the simulation engine (replaces ngspice).
+
+Options:
+  --eeschema, -e    Launch eeschema directly (instead of KiCad manager)
+  --help, -h        Show this help
+
+Environment:
+  XYCE_BUILD        Path to Xyce build directory (default: /usr/local/src/xyce-build)
+
+The shim intercepts KiCad's ngspice calls and routes them through Xyce.
+All simulation types are supported via Xyce's SPICE-compatible engine.
+EOF
+        exit 0
+        ;;
+esac
+
+exec "$CMD" "$@"
