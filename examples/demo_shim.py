@@ -27,14 +27,21 @@ if not os.path.exists(shim_path):
     print("Run: make -C lib/ngspice_shim")
     sys.exit(1)
 
-# Ensure Xyce libs are findable
+# Ensure Xyce libs are findable — LD_LIBRARY_PATH must be set before
+# the process starts (dlopen doesn't re-read it).  If it's not set,
+# re-exec ourselves with the right environment.
 xyce_build = os.environ.get('XYCE_BUILD', '/usr/local/src/xyce-build')
+needed_dirs = [
+    os.path.join(ltz_root, 'lib', 'ngspice_shim'),
+    f'{xyce_build}/src',
+    f'{xyce_build}/utils/XyceCInterface',
+]
 ld_path = os.environ.get('LD_LIBRARY_PATH', '')
-for d in [f'{xyce_build}/src', f'{xyce_build}/utils/XyceCInterface',
-          os.path.join(ltz_root, 'lib', 'ngspice_shim')]:
-    if d not in ld_path:
-        ld_path = d + ':' + ld_path
-os.environ['LD_LIBRARY_PATH'] = ld_path
+missing = [d for d in needed_dirs if d not in ld_path]
+
+if missing:
+    os.environ['LD_LIBRARY_PATH'] = ':'.join(needed_dirs) + (':' + ld_path if ld_path else '')
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 lib = CDLL(shim_path, RTLD_GLOBAL)
 
