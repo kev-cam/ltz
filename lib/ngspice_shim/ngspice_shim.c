@@ -30,6 +30,34 @@
 #include <unistd.h>
 #include <math.h>
 #include <ctype.h>
+#include <fcntl.h>
+
+/* ------------------------------------------------------------------ */
+/* Suppress Xyce banner/timing output                                 */
+/* ------------------------------------------------------------------ */
+static int saved_stdout = -1, saved_stderr = -1;
+
+static void suppress_output(void)
+{
+    fflush(stdout);
+    fflush(stderr);
+    saved_stdout = dup(STDOUT_FILENO);
+    saved_stderr = dup(STDERR_FILENO);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+    }
+}
+
+static void restore_output(void)
+{
+    fflush(stdout);
+    fflush(stderr);
+    if (saved_stdout >= 0) { dup2(saved_stdout, STDOUT_FILENO); close(saved_stdout); saved_stdout = -1; }
+    if (saved_stderr >= 0) { dup2(saved_stderr, STDERR_FILENO); close(saved_stderr); saved_stderr = -1; }
+}
 
 /* ------------------------------------------------------------------ */
 /* Xyce C interface (from libxycecinterface.so)                       */
@@ -46,6 +74,13 @@ extern int   xyce_obtainResponse(void **ptr, char *name, double *val);
 extern _Bool xyce_checkCircuitParameterExists(void **ptr, char *name);
 extern int   xyce_getMemBufData(void **ptr, const char **data, int *length);
 extern void  xyce_advanceMemBufRead(void **ptr, int n);
+
+/* Quiet wrappers — suppress Xyce's banner/timing output */
+static void quiet_xyce_close(void **ptr)    { suppress_output(); xyce_close(ptr); restore_output(); }
+static int  quiet_xyce_init(void **ptr, int argc, char **argv)
+    { suppress_output(); int r = xyce_initialize(ptr, argc, argv); restore_output(); return r; }
+static int  quiet_xyce_run(void **ptr)
+    { suppress_output(); int r = xyce_runSimulation(ptr); restore_output(); return r; }
 
 /* ------------------------------------------------------------------ */
 /* Internal state                                                     */
@@ -520,7 +555,7 @@ static void *sim_thread_func(void *arg)
         send_msg("stderr Error: no circuit loaded\n");
         goto done;
     }
-    xyce_runSimulation(&xyce_ptr);
+    quiet_xyce_run(&xyce_ptr);
 
     /* Read all data from the mem:// buffer */
     {
@@ -645,7 +680,7 @@ int ngSpice_Circ(char **circarray)
 
     /* Close and reopen Xyce for fresh state */
     if (xyce_initialized) {
-        xyce_close(&xyce_ptr);
+        quiet_xyce_close(&xyce_ptr);
         xyce_ptr = NULL;
         xyce_initialized = false;
     }
@@ -653,12 +688,12 @@ int ngSpice_Circ(char **circarray)
     xyce_initialized = true;
 
     char *argv[] = { "Xyce", "-quiet", (char *)tmpf };
-    int rc = xyce_initialize(&xyce_ptr, 3, argv);
+    int rc = quiet_xyce_init(&xyce_ptr, 3, argv);
 
     if (rc != 1) {
         send_msg("stderr Error: Xyce failed to initialize circuit\n");
         /* Xyce is in bad state after failed init — tear it down */
-        xyce_close(&xyce_ptr);
+        quiet_xyce_close(&xyce_ptr);
         xyce_ptr = NULL;
         xyce_initialized = false;
         return 1;
@@ -710,7 +745,7 @@ int ngSpice_Command(char *command)
         /* Reset — reload the circuit if we have a real one */
         if (stored_netlist && xyce_initialized &&
             detect_sim_type(stored_netlist) != SIM_UNKNOWN) {
-            xyce_close(&xyce_ptr);
+            quiet_xyce_close(&xyce_ptr);
             xyce_ptr = NULL;
             xyce_initialized = false;
             xyce_open(&xyce_ptr);
@@ -719,8 +754,8 @@ int ngSpice_Command(char *command)
             const char *tmpf = write_netlist_tmpfile(stored_netlist);
             if (tmpf) {
                 char *argv[] = { "Xyce", "-quiet", (char *)tmpf };
-                if (xyce_initialize(&xyce_ptr, 3, argv) != 1) {
-                    xyce_close(&xyce_ptr);
+                if (quiet_xyce_init(&xyce_ptr, 3, argv) != 1) {
+                    quiet_xyce_close(&xyce_ptr);
                     xyce_ptr = NULL;
                     xyce_initialized = false;
                 }
@@ -917,7 +952,7 @@ __attribute__((destructor))
 static void shim_cleanup(void)
 {
     if (xyce_initialized) {
-        xyce_close(&xyce_ptr);
+        quiet_xyce_close(&xyce_ptr);
         xyce_ptr = NULL;
         xyce_initialized = false;
     }

@@ -1,0 +1,15 @@
+* Simple Analog Phase-Locked Loop
+* Demonstrates ltz ngspice shim driving Xyce
+*
+* Reference: 100kHz sine
+* VCO: 80kHz free-run + 200kHz/V gain (SDT-based)
+* Loop filter: R=100, C=100n (lead-lag)
+*
+Vref in 0 SIN(0 1 100k)
+Bpd pd 0 V = {V(in) * V(vco)}
+R1 pd lpf 100
+C1 lpf 0 100n
+Bvco vco 0 V = {SIN(6.283185 * (80e3*TIME + 200e3*SDT(V(lpf))))}
+.TRAN 0.1u 500u
+.PRINT TRAN V(in) V(vco) V(lpf)
+.END
