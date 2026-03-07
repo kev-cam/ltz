@@ -36,6 +36,7 @@ my $opt_verbose = 0;
 my $opt_help    = 0;
 my $opt_version = 0;
 my $opt_no_lib  = 0;
+my $opt_raw     = '';
 
 # Pin offsets for common LTspice symbols, in default (R0) orientation.
 # Pin order matches SPICE node order for the component prefix.
@@ -101,6 +102,7 @@ GetOptions(
     'h|help'    => \$opt_help,
     'version'   => \$opt_version,
     'no-lib'    => \$opt_no_lib,
+    'r=s'       => \$opt_raw,
 ) or usage_exit();
 
 if ($opt_version) {
@@ -192,6 +194,14 @@ sub run {
 
     my @xyce_args;
     push @xyce_args, '-a' if $opt_ascii;
+
+    # Auto-generate .raw file next to input (like LTspice does) unless -r given
+    my $raw_file = $opt_raw;
+    if (!$raw_file) {
+        $raw_file = File::Spec->catfile($dir, "${name}.raw");
+        verbose("Auto-generating .raw: $raw_file");
+    }
+    push @xyce_args, '-r', $raw_file;
 
     if ($opt_output) {
         push @xyce_args, '-o', $opt_output;
@@ -923,7 +933,8 @@ Options:
   -b              Batch mode: convert and simulate (default)
   -netlist        Convert to Xyce netlist only (no simulation)
   -o FILE         Output file path
-  -ascii          Force ASCII output from Xyce
+  -r FILE         Write .raw waveform file (default: <input>.raw)
+  -ascii          Force ASCII output from Xyce (applies to -r too)
   --no-lib        Don't auto-include bundled model library
   -v, --verbose   Show pipeline details
   -h, --help      Show this help
@@ -945,8 +956,8 @@ Examples:
   ltz -b -v circuit.asc               # verbose pipeline trace
 
 Output:
-  Xyce writes .prn files (tabular text), not LTspice .raw format.
-  Use -o to control output basename.
+  Produces a .raw waveform file next to the input (like LTspice).
+  Use -r to specify a different .raw path, -ascii for text format.
 USAGE
     exit 1;
 }
