@@ -31,6 +31,10 @@
 #include <math.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <setjmp.h>
+#include <sys/wait.h>
 
 /* ------------------------------------------------------------------ */
 /* Suppress Xyce banner/timing output                                 */
@@ -60,6 +64,48 @@ static void restore_output(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Library load/unload notification                                   */
+/* ------------------------------------------------------------------ */
+static void crash_handler(int sig)
+{
+    const char msg[] = "\nLTZ_SHIM: CRASH (signal  )\n";
+    /* Async-signal-safe write */
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "\nLTZ_SHIM: CRASH signal %d\n", sig);
+    if (n > 0) write(STDERR_FILENO, buf, n);
+    _exit(128 + sig);
+}
+
+static FILE *dbg_log = NULL;
+
+static void dbg(const char *fmt, ...)
+{
+    if (!dbg_log) {
+        dbg_log = fopen("/tmp/ltz_shim_debug.log", "a");
+        if (!dbg_log) return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(dbg_log, fmt, ap);
+    va_end(ap);
+    fflush(dbg_log);
+    /* Also try stderr */
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+}
+
+__attribute__((constructor))
+static void shim_loaded(void)
+{
+    dbg("LTZ_SHIM: libngspice.so.0 shim loaded (Xyce backend)\n");
+    signal(SIGSEGV, crash_handler);
+    signal(SIGABRT, crash_handler);
+    signal(SIGBUS, crash_handler);
+}
+
+/* ------------------------------------------------------------------ */
 /* Xyce C interface (from libxycecinterface.so)                       */
 /* ------------------------------------------------------------------ */
 extern void  xyce_open(void **ptr);
@@ -72,15 +118,54 @@ extern double xyce_getTime(void **ptr);
 extern double xyce_getFinalTime(void **ptr);
 extern int   xyce_obtainResponse(void **ptr, char *name, double *val);
 extern _Bool xyce_checkCircuitParameterExists(void **ptr, char *name);
-extern int   xyce_getMemBufData(void **ptr, const char **data, int *length);
-extern void  xyce_advanceMemBufRead(void **ptr, int n);
+/* mem:// buffer functions — kept for reference but not currently used.
+ * The mem:// buffer has a ~512KB capacity limit which truncates long sims.
+ * We use FILE= output instead. */
+/* extern int   xyce_getMemBufData(void **ptr, const char **data, int *length); */
+/* extern void  xyce_advanceMemBufRead(void **ptr, int n); */
 
 /* Quiet wrappers — suppress Xyce's banner/timing output */
 static void quiet_xyce_close(void **ptr)    { suppress_output(); xyce_close(ptr); restore_output(); }
-static int  quiet_xyce_init(void **ptr, int argc, char **argv)
-    { suppress_output(); int r = xyce_initialize(ptr, argc, argv); restore_output(); return r; }
 static int  quiet_xyce_run(void **ptr)
     { suppress_output(); int r = xyce_runSimulation(ptr); restore_output(); return r; }
+
+/* Safe Xyce init — fork a child to test-parse first, since Xyce calls exit() on errors.
+ * The child uses _Exit() to avoid running atexit handlers (wx cleanup crashes). */
+static int  quiet_xyce_init(void **ptr, int argc, char **argv)
+{
+    fflush(stdout); fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: redirect all output, try xyce_initialize.
+         * If Xyce calls exit(), atexit handlers will run and may crash,
+         * so install our own handler to call _Exit() instead. */
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        void *test_ptr = NULL;
+        xyce_open(&test_ptr);
+        int rc = xyce_initialize(&test_ptr, argc, argv);
+        /* If we get here, parse succeeded */
+        _Exit(rc == 1 ? 0 : 1);
+    }
+    /* Parent: wait for child */
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        dbg("LTZ_SHIM: Xyce rejected netlist (child status=%d exit=%d)\n",
+                status, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return 0;  /* 0 = failure for xyce_initialize */
+    }
+
+    /* Netlist is valid — do the real init in the parent */
+    suppress_output();
+    int r = xyce_initialize(ptr, argc, argv);
+    restore_output();
+    return r;
+}
 
 /* ------------------------------------------------------------------ */
 /* Internal state                                                     */
@@ -317,23 +402,23 @@ static const char *write_netlist_tmpfile(const char *netlist)
     return netlist_tmpfile;
 }
 
-/* mem:// base path for this process */
-static char membuf_path[512] = "";
+/* CSV output file path for this process */
+static char csv_outpath[512] = "";
 
-static const char *get_membuf_path(void)
+static const char *get_csv_outpath(void)
 {
-    if (membuf_path[0] == '\0')
-        snprintf(membuf_path, sizeof(membuf_path),
-                 "/tmp/ltz_shim_%d", (int)getpid());
-    return membuf_path;
+    if (csv_outpath[0] == '\0')
+        snprintf(csv_outpath, sizeof(csv_outpath),
+                 "/tmp/ltz_shim_%d.csv", (int)getpid());
+    return csv_outpath;
 }
 
-/* Inject FILE=mem://... FORMAT=CSV into all .PRINT lines.
+/* Inject FILE=<path> FORMAT=CSV into all .PRINT lines.
  * If no .PRINT exists, add one before .END.
  * Also removes any existing FILE= directives. */
-static char *inject_mem_print(const char *netlist, sim_type_t st)
+static char *inject_csv_print(const char *netlist, sim_type_t st)
 {
-    const char *mem_path = get_membuf_path();
+    const char *csv_path = get_csv_outpath();
     size_t len = strlen(netlist);
     /* Generous allocation */
     char *result = malloc(len + 1024);
@@ -397,8 +482,8 @@ static char *inject_mem_print(const char *netlist, sim_type_t st)
             /* Build the new .PRINT line */
             char inject[4096];
             snprintf(inject, sizeof(inject),
-                     ".PRINT %s FORMAT=CSV FILE=mem://%s %s\n",
-                     analysis_word, mem_path, vectors);
+                     ".PRINT %s FORMAT=CSV FILE=%s %s\n",
+                     analysis_word, csv_path, vectors);
             strcat(result, inject);
         } else {
             /* Copy line as-is */
@@ -440,12 +525,88 @@ static char *inject_mem_print(const char *netlist, sim_type_t st)
         }
 
         if (end_pos) {
+            /* Collect node names from the netlist for V() output */
+            char node_list[4096] = "";
+            int nl_len = 0;
+            /* Scan result for component lines to extract nodes */
+            char *scan = result;
+            char seen_nodes[64][MAX_NAME_LEN];
+            int n_seen = 0;
+            while (*scan) {
+                char *ls = scan;
+                while (*scan && *scan != '\n') scan++;
+                if (*scan == '\n') scan++;
+                /* Skip comments, directives, .PRINT, .END etc */
+                char *ws = ls;
+                while (*ws == ' ' || *ws == '\t') ws++;
+                if (*ws == '*' || *ws == '.' || *ws == '\0' || *ws == '\n')
+                    continue;
+                /* Component line: first token is name, rest are nodes + value */
+                /* Extract nodes: skip first token (component name), then grab
+                 * tokens that look like node names (not numbers/values) */
+                char *tok = ws;
+                char comp_prefix = toupper(*tok);
+                while (*tok && *tok != ' ' && *tok != '\t' && *tok != '\n') tok++;
+                while (*tok == ' ' || *tok == '\t') tok++;
+
+                /* Determine max node count by component type:
+                 * B (behavioral): 2 nodes then expression
+                 * V, I (sources): 2 nodes then source spec
+                 * R, C, L: 2 nodes then value
+                 * E, F, G, H (controlled sources): 4 nodes
+                 * M (MOSFET): 4 nodes, Q (BJT): 3-4 nodes
+                 * Default: 4 for safety */
+                int max_nodes = 4;
+                if (comp_prefix == 'B' || comp_prefix == 'V' ||
+                    comp_prefix == 'I' || comp_prefix == 'R' ||
+                    comp_prefix == 'C' || comp_prefix == 'L')
+                    max_nodes = 2;
+
+                /* Now tok points at first node. Grab node tokens until we hit
+                 * something that looks like a value or end of line */
+                int node_count = 0;
+                while (*tok && *tok != '\n') {
+                    char node[MAX_NAME_LEN];
+                    int ni = 0;
+                    while (*tok && *tok != ' ' && *tok != '\t' && *tok != '\n'
+                           && ni < MAX_NAME_LEN - 1)
+                        node[ni++] = *tok++;
+                    node[ni] = '\0';
+                    while (*tok == ' ' || *tok == '\t') tok++;
+                    /* Skip GND/0, values (start with digit), and known keywords */
+                    if (strcasecmp(node, "GND") == 0 || strcasecmp(node, "0") == 0) {
+                        node_count++;
+                        if (node_count >= max_nodes) break;
+                        continue;
+                    }
+                    if (node[0] >= '0' && node[0] <= '9') break; /* value */
+                    if (strcasecmp(node, "DC") == 0 || strcasecmp(node, "AC") == 0 ||
+                        strcasecmp(node, "SIN(") == 0 || strchr(node, '('))
+                        break; /* keyword/function */
+                    node_count++;
+                    /* Check if already seen */
+                    _Bool dup = false;
+                    for (int i = 0; i < n_seen; i++)
+                        if (strcasecmp(seen_nodes[i], node) == 0) { dup = true; break; }
+                    if (!dup && n_seen < 64) {
+                        strncpy(seen_nodes[n_seen], node, MAX_NAME_LEN - 1);
+                        n_seen++;
+                        if (nl_len > 0) nl_len += snprintf(node_list + nl_len,
+                            sizeof(node_list) - nl_len, " ");
+                        nl_len += snprintf(node_list + nl_len,
+                            sizeof(node_list) - nl_len, "V(%s)", node);
+                    }
+                    if (node_count >= max_nodes) break;
+                }
+            }
             /* Shift .END forward to make room */
             char tail[4096];
             strncpy(tail, end_pos, sizeof(tail) - 1);
             tail[sizeof(tail) - 1] = '\0';
-            sprintf(end_pos, ".PRINT %s FORMAT=CSV FILE=mem://%s\n%s",
-                    analysis, mem_path, tail);
+            sprintf(end_pos, ".PRINT %s FORMAT=CSV FILE=%s %s\n%s",
+                    analysis, csv_path,
+                    nl_len > 0 ? node_list : "V(*)",
+                    tail);
         }
     }
 
@@ -455,6 +616,122 @@ static char *inject_mem_print(const char *netlist, sim_type_t st)
 /* ------------------------------------------------------------------ */
 /* Background simulation thread                                       */
 /* ------------------------------------------------------------------ */
+
+/* Resample variable-timestep data onto a uniform grid.
+ * Real ngspice outputs at the print step (first .tran param), so KiCad
+ * expects uniformly-spaced data.  Xyce outputs at internal adaptive
+ * timesteps, which can cause rendering issues.
+ *
+ * Uses linear interpolation between adjacent Xyce timesteps.
+ */
+static void resample_plot_uniform(stored_plot_t *plot, double tstep)
+{
+    dbg("LTZ_SHIM: resample_plot_uniform called, nvecs=%d tstep=%.3e\n",
+        plot->nvecs, tstep);
+    if (plot->nvecs < 1) { dbg("LTZ_SHIM: resample: no vecs\n"); return; }
+    stored_vec_t *tvec = &plot->vecs[0];  /* time vector (must be first) */
+    if (!tvec->realdata || tvec->length < 2) { dbg("LTZ_SHIM: resample: no time data\n"); return; }
+
+    double t_start = tvec->realdata[0];
+    double t_end = tvec->realdata[tvec->length - 1];
+    dbg("LTZ_SHIM: resample: t_start=%.6e t_end=%.6e\n", t_start, t_end);
+    if (t_end <= t_start || tstep <= 0) { dbg("LTZ_SHIM: resample: bad range\n"); return; }
+
+    int npts = (int)((t_end - t_start) / tstep) + 1;
+    if (npts < 2) { dbg("LTZ_SHIM: resample: too few pts (%d)\n", npts); return; }
+    if (npts > 100000) npts = 100000;  /* sanity limit */
+
+    dbg("LTZ_SHIM: resampling %d raw pts -> %d uniform pts (tstep=%.3e)\n",
+        tvec->length, npts, tstep);
+
+    /* Allocate new arrays for all vectors */
+    double **new_data = calloc(plot->nvecs, sizeof(double *));
+    for (int v = 0; v < plot->nvecs; v++)
+        new_data[v] = malloc(npts * sizeof(double));
+
+    /* Generate uniform time grid and interpolate each vector */
+    int src_idx = 0;  /* current position in source data */
+    for (int i = 0; i < npts; i++) {
+        double t = t_start + i * tstep;
+        if (t > t_end) t = t_end;
+
+        /* Advance src_idx so that tvec->realdata[src_idx] <= t < tvec->realdata[src_idx+1] */
+        while (src_idx < tvec->length - 2 && tvec->realdata[src_idx + 1] <= t)
+            src_idx++;
+
+        /* Linear interpolation factor */
+        double t0 = tvec->realdata[src_idx];
+        double t1 = tvec->realdata[src_idx + 1 < tvec->length ? src_idx + 1 : src_idx];
+        double frac = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0;
+        if (frac < 0.0) frac = 0.0;
+        if (frac > 1.0) frac = 1.0;
+
+        /* Time vector */
+        new_data[0][i] = t;
+
+        /* Interpolate all other vectors */
+        for (int v = 1; v < plot->nvecs; v++) {
+            stored_vec_t *sv = &plot->vecs[v];
+            if (sv->realdata && src_idx < sv->length) {
+                double v0 = sv->realdata[src_idx];
+                double v1 = (src_idx + 1 < sv->length) ? sv->realdata[src_idx + 1] : v0;
+                new_data[v][i] = v0 + frac * (v1 - v0);
+            } else {
+                new_data[v][i] = 0.0;
+            }
+        }
+    }
+
+    /* Replace old data with resampled data */
+    for (int v = 0; v < plot->nvecs; v++) {
+        free(plot->vecs[v].realdata);
+        plot->vecs[v].realdata = new_data[v];
+        plot->vecs[v].length = npts;
+        plot->vecs[v].capacity = npts;
+    }
+    free(new_data);
+}
+
+/* Extract the print step (first param) from a .tran line in the netlist.
+ * .tran <tstep> <tstop> [tstart] [tmax]
+ * Returns tstep, or 0 if not found. */
+static double extract_tran_tstep(const char *netlist)
+{
+    const char *p = netlist;
+    while (p && *p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '.' && strncasecmp(p, ".tran", 5) == 0 && !isalpha(p[5])) {
+            p += 5;
+            while (*p == ' ' || *p == '\t') p++;
+            /* Parse tstep value — handle SPICE suffixes */
+            char buf[64];
+            int bi = 0;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && bi < 63)
+                buf[bi++] = *p++;
+            buf[bi] = '\0';
+            /* Parse with SPICE suffix support */
+            char *endp;
+            double val = strtod(buf, &endp);
+            if (endp > buf) {
+                /* Handle SPICE suffixes */
+                switch (tolower(*endp)) {
+                case 'f': val *= 1e-15; break;
+                case 'p': val *= 1e-12; break;
+                case 'n': val *= 1e-9;  break;
+                case 'u': val *= 1e-6;  break;
+                case 'm': val *= 1e-3;  break;
+                case 'k': val *= 1e3;   break;
+                case 'g': val *= 1e9;   break;
+                case 't': val *= 1e12;  break;
+                }
+                return val;
+            }
+        }
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+    return 0.0;
+}
 
 /* Parse CSV data from mem:// buffer into plot vectors.
  * CSV format: first line is header "TIME,V(in),V(out),..."
@@ -538,8 +815,11 @@ static void *sim_thread_func(void *arg)
 {
     (void)arg;
 
+    dbg("LTZ_SHIM: sim_thread_func started, stored_netlist=%p\n", (void*)stored_netlist);
+
     sim_type_t st = detect_sim_type(stored_netlist);
     _Bool is_ac = (st == SIM_AC);
+    dbg("LTZ_SHIM: sim_type=%d is_ac=%d\n", st, is_ac);
 
     /* Create plot */
     char plot_name[64];
@@ -550,22 +830,82 @@ static void *sim_thread_func(void *arg)
         goto done;
     }
 
+    /* Check for synthetic test mode */
+    if (getenv("LTZ_SYNTHETIC")) {
+        dbg("LTZ_SHIM: SYNTHETIC mode — generating test sine wave\n");
+        int npts = 1000;
+        double dt = 500e-6 / npts;
+        stored_vec_t *vt = get_or_create_vec(plot, "time", false, true);
+        stored_vec_t *vo = get_or_create_vec(plot, "v(out)", false, false);
+        stored_vec_t *vi2 = get_or_create_vec(plot, "v(in)", false, false);
+        for (int i = 0; i < npts; i++) {
+            double t = i * dt;
+            vec_append_real(vt, t);
+            vec_append_real(vi2, 3.3 * sin(2.0 * M_PI * 10000.0 * t));
+            vec_append_real(vo, 1.5 * sin(2.0 * M_PI * 10000.0 * t - 0.8));
+        }
+        dbg("LTZ_SHIM: synthetic: %d pts, time=[%.3e..%.3e] vout=[%.3e..%.3e]\n",
+            npts, vt->realdata[0], vt->realdata[npts-1],
+            vo->realdata[0], vo->realdata[npts-1]);
+    } else {
     /* Run the full simulation — Xyce accumulates CSV data in mem:// buffer */
     if (!xyce_initialized) {
         send_msg("stderr Error: no circuit loaded\n");
         goto done;
     }
-    quiet_xyce_run(&xyce_ptr);
+    dbg("LTZ_SHIM: calling xyce_run, ptr=%p\n", xyce_ptr);
+    int run_rc = quiet_xyce_run(&xyce_ptr);
+    dbg("LTZ_SHIM: xyce_run returned rc=%d\n", run_rc);
 
-    /* Read all data from the mem:// buffer */
+    /* Read simulation results from CSV file */
     {
-        const char *data = NULL;
-        int length = 0;
-        if (xyce_getMemBufData(&xyce_ptr, &data, &length) == 1 && length > 0) {
-            parse_csv_into_plot(plot, data, length, is_ac);
-            xyce_advanceMemBufRead(&xyce_ptr, length);
+        const char *csvfile = get_csv_outpath();
+        FILE *fp = fopen(csvfile, "r");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            long fsize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            char *data = malloc(fsize + 1);
+            if (data) {
+                size_t nread = fread(data, 1, fsize, fp);
+                data[nread] = '\0';
+                dbg("LTZ_SHIM: CSV file '%s' size=%ld\n", csvfile, fsize);
+                int preview = nread < 400 ? (int)nread : 400;
+                dbg("LTZ_SHIM: CSV preview: %.*s\n", preview, data);
+                parse_csv_into_plot(plot, data, nread, is_ac);
+                free(data);
+            }
+            fclose(fp);
+            unlink(csvfile);  /* clean up */
+        } else {
+            dbg("LTZ_SHIM: ERROR: cannot open CSV file '%s'\n", csvfile);
+        }
+        if (plot->nvecs > 0) {
+            dbg("LTZ_SHIM: parsed %d vectors, first vec length=%d\n",
+                    plot->nvecs, plot->vecs[0].length);
+
+            /* Resample to uniform timesteps (matching what real ngspice outputs) */
+            if (!is_ac && plot->nvecs > 0 && plot->vecs[0].length > 1) {
+                double tstep = extract_tran_tstep(stored_netlist);
+                dbg("LTZ_SHIM: extract_tran_tstep returned %.6e\n", tstep);
+                if (tstep > 0) {
+                    resample_plot_uniform(plot, tstep);
+                } else {
+                    dbg("LTZ_SHIM: WARNING: tstep=0, skipping resample\n");
+                }
+            }
+
+            /* Dump first 3 data points of each vector */
+            for (int vi = 0; vi < plot->nvecs && vi < 5; vi++) {
+                stored_vec_t *v = &plot->vecs[vi];
+                dbg("LTZ_SHIM:   vec[%d] '%s': len=%d", vi, v->name, v->length);
+                if (v->realdata && v->length >= 3)
+                    dbg(" [%.6e, %.6e, %.6e]", v->realdata[0], v->realdata[1], v->realdata[2]);
+                dbg("\n");
+            }
         }
     }
+    } /* end else (non-synthetic) */
 
     /* Send init data callback with final vector info */
     if (cb_sendinit && plot->nvecs > 0) {
@@ -611,6 +951,7 @@ int ngSpice_Init(SendChar *printfcn, SendStat *statfcn, ControlledExit *ngexit,
                  SendData *sdata, SendInitData *sinitdata,
                  BGThreadRunning *bgtrun, void *userData)
 {
+    dbg("LTZ_SHIM: ngSpice_Init called\n");
     cb_sendchar = printfcn;
     cb_sendstat = statfcn;
     cb_exit     = ngexit;
@@ -621,11 +962,14 @@ int ngSpice_Init(SendChar *printfcn, SendStat *statfcn, ControlledExit *ngexit,
 
     /* Initialize Xyce */
     if (!xyce_initialized) {
+        dbg("LTZ_SHIM: calling xyce_open\n");
         xyce_open(&xyce_ptr);
         xyce_initialized = true;
+        dbg("LTZ_SHIM: xyce_open done, ptr=%p\n", xyce_ptr);
     }
 
     send_msg("stdout ltz ngspice shim (Xyce backend) initialized\n");
+    dbg("LTZ_SHIM: ngSpice_Init done\n");
     return 0;
 }
 
@@ -641,6 +985,7 @@ int ngSpice_Init_Sync(GetVSRCData *vsrcdat, GetISRCData *isrcdat,
 IMPEXP
 int ngSpice_Circ(char **circarray)
 {
+    dbg("LTZ_SHIM: ngSpice_Circ called, circarray=%p\n", (void*)circarray);
     if (!circarray)
         return 1;
 
@@ -660,6 +1005,58 @@ int ngSpice_Circ(char **circarray)
         strcat(stored_netlist, "\n");
     }
 
+    /* Clean up ngspice-specific syntax for Xyce compatibility */
+    {
+        /* Generous allocation for possible expansions */
+        char *cleaned = malloc(strlen(stored_netlist) * 2 + 1);
+        if (!cleaned) return 1;
+        char *dst = cleaned;
+        const char *src = stored_netlist;
+        while (*src) {
+            /* Find end of line */
+            const char *eol = strchr(src, '\n');
+            if (!eol) eol = src + strlen(src);
+            int len = eol - src;
+
+            /* Skip ngspice-only directives */
+            if (strncasecmp(src, ".save ", 6) == 0 ||
+                strncasecmp(src, ".save\n", 6) == 0 ||
+                strncasecmp(src, ".probe ", 7) == 0 ||
+                strncasecmp(src, ".probe\n", 7) == 0 ||
+                strncasecmp(src, ".control", 8) == 0 ||
+                strncasecmp(src, ".endc", 5) == 0) {
+                /* Skip this line */
+                src = *eol ? eol + 1 : eol;
+                continue;
+            }
+
+            /* Copy line with ngspice→Xyce translations:
+             * - Strip leading / from node names (/out → out)
+             * - Replace GND with 0 (Xyce ground node) */
+            for (int i = 0; i < len; i++) {
+                if (src[i] == '/' && (i == 0 || src[i-1] == ' ' || src[i-1] == '\t')) {
+                    /* Skip the leading / on node names */
+                    continue;
+                }
+                /* Replace GND with 0 as a whole word */
+                if (strncasecmp(&src[i], "GND", 3) == 0 &&
+                    (i == 0 || src[i-1] == ' ' || src[i-1] == '\t') &&
+                    (i + 3 >= len || src[i+3] == ' ' || src[i+3] == '\t' ||
+                     src[i+3] == '\n' || src[i+3] == '\r' || src[i+3] == ')')) {
+                    *dst++ = '0';
+                    i += 2;  /* skip 'N' and 'D', loop will advance past 'D' */
+                    continue;
+                }
+                *dst++ = src[i];
+            }
+            *dst++ = '\n';
+            src = *eol ? eol + 1 : eol;
+        }
+        *dst = '\0';
+        free(stored_netlist);
+        stored_netlist = cleaned;
+    }
+
     sim_type_t st = detect_sim_type(stored_netlist);
 
     /* Skip trivial/empty circuits (KiCad sends [*, .end] on startup) */
@@ -669,7 +1066,7 @@ int ngSpice_Circ(char **circarray)
     }
 
     /* Inject FILE=mem:// FORMAT=CSV into .PRINT lines */
-    char *nl = inject_mem_print(stored_netlist, st);
+    char *nl = inject_csv_print(stored_netlist, st);
     free(stored_netlist);
     stored_netlist = nl;
 
@@ -677,6 +1074,9 @@ int ngSpice_Circ(char **circarray)
     const char *tmpf = write_netlist_tmpfile(stored_netlist);
     if (!tmpf)
         return 1;
+
+    dbg("LTZ_SHIM: netlist written to %s\n", tmpf);
+    dbg("LTZ_SHIM: --- netlist ---\n%s\nLTZ_SHIM: --- end ---\n", stored_netlist);
 
     /* Close and reopen Xyce for fresh state */
     if (xyce_initialized) {
@@ -706,6 +1106,7 @@ int ngSpice_Circ(char **circarray)
 IMPEXP
 int ngSpice_Command(char *command)
 {
+    dbg("LTZ_SHIM: ngSpice_Command('%s')\n", command ? command : "(null)");
     if (!command)
         return 1;
 
@@ -716,6 +1117,9 @@ int ngSpice_Command(char *command)
     if (strncasecmp(command, "bg_run", 6) == 0 ||
         strcmp(command, "run") == 0) {
         /* Start simulation in background thread */
+        send_msg("stdout LTZ: starting bg_run\n");
+        dbg("LTZ_SHIM: bg_run, stored_netlist=%p xyce_initialized=%d\n",
+                (void*)stored_netlist, xyce_initialized);
         pthread_mutex_lock(&sim_mutex);
         if (sim_running) {
             pthread_mutex_unlock(&sim_mutex);
@@ -765,7 +1169,9 @@ int ngSpice_Command(char *command)
     }
 
     if (strcmp(command, "remcirc") == 0) {
-        clear_all_plots();
+        /* In real ngspice, remcirc removes the circuit but plots persist.
+         * KiCad calls remcirc before loading a new circuit via ngSpice_Circ.
+         * Do NOT clear plots here — data must survive for KiCad to read. */
         return 0;
     }
 
@@ -798,8 +1204,27 @@ int ngSpice_Command(char *command)
     if (strncmp(command, "esave", 5) == 0)
         return 0;
 
+    /* "setplot" — set current plot by name */
+    if (strncmp(command, "setplot", 7) == 0) {
+        const char *pname = command + 7;
+        while (*pname == ' ') pname++;
+        if (*pname) {
+            for (int i = 0; i < nplots; i++) {
+                if (strcasecmp(plots[i].name, pname) == 0) {
+                    cur_plot = i;
+                    break;
+                }
+            }
+        }
+        return 0;
+    }
+
     /* "codemodel" — silently accept (we don't need ngspice codemodels) */
     if (strncmp(command, "codemodel", 9) == 0)
+        return 0;
+
+    /* "source" — silently accept (ngspice loads spinit) */
+    if (strncmp(command, "source", 6) == 0)
         return 0;
 
     /* Unknown command — log and accept */
@@ -815,6 +1240,8 @@ int ngSpice_Command(char *command)
 IMPEXP
 pvector_info ngGet_Vec_Info(char *vecname)
 {
+    dbg("LTZ_SHIM: ngGet_Vec_Info('%s') cur_plot=%d nplots=%d\n",
+            vecname ? vecname : "(null)", cur_plot, nplots);
     if (!vecname || cur_plot < 0 || cur_plot >= nplots)
         return NULL;
 
@@ -840,6 +1267,25 @@ pvector_info ngGet_Vec_Info(char *vecname)
         }
     }
 
+    /* Normalize the requested name: strip leading / from inside V() or I()
+     * e.g. V(/out) -> V(out), I(/R1) -> I(R1) */
+    char norm_name[MAX_NAME_LEN];
+    {
+        const char *s = vname;
+        char *d = norm_name;
+        char *dend = norm_name + MAX_NAME_LEN - 1;
+        while (*s && d < dend) {
+            if (*s == '/' && d > norm_name && *(d-1) == '(') {
+                /* Skip / after ( */
+                s++;
+                continue;
+            }
+            *d++ = *s++;
+        }
+        *d = '\0';
+        vname = norm_name;
+    }
+
     /* Find the vector */
     for (int i = 0; i < plot->nvecs; i++) {
         if (strcasecmp(plot->vecs[i].name, vname) == 0) {
@@ -850,16 +1296,23 @@ pvector_info ngGet_Vec_Info(char *vecname)
             ret_vecinfo.v_realdata = v->realdata;
             ret_vecinfo.v_compdata = v->compdata;
             ret_vecinfo.v_length = v->length;
+            dbg("LTZ_SHIM: ngGet_Vec_Info -> FOUND '%s' length=%d\n", v->name, v->length);
             return &ret_vecinfo;
         }
     }
 
+    dbg("LTZ_SHIM: ngGet_Vec_Info -> NOT FOUND (normalized='%s', plot has %d vecs:",
+            vname, plot->nvecs);
+    for (int i = 0; i < plot->nvecs && i < 10; i++)
+        dbg(" '%s'", plot->vecs[i].name);
+    dbg(")\n");
     return NULL;
 }
 
 IMPEXP
 char *ngSpice_CurPlot(void)
 {
+    dbg("LTZ_SHIM: ngSpice_CurPlot() cur_plot=%d nplots=%d\n", cur_plot, nplots);
     if (cur_plot >= 0 && cur_plot < nplots)
         return plots[cur_plot].name;
     return "const";
@@ -868,6 +1321,7 @@ char *ngSpice_CurPlot(void)
 IMPEXP
 char **ngSpice_AllPlots(void)
 {
+    dbg("LTZ_SHIM: ngSpice_AllPlots() nplots=%d\n", nplots);
     for (int i = 0; i < nplots; i++)
         all_plots_arr[i] = plots[i].name;
     all_plots_arr[nplots] = NULL;
@@ -877,6 +1331,7 @@ char **ngSpice_AllPlots(void)
 IMPEXP
 char **ngSpice_AllVecs(char *plotname)
 {
+    dbg("LTZ_SHIM: ngSpice_AllVecs('%s')\n", plotname ? plotname : "(null)");
     stored_plot_t *plot = NULL;
 
     if (plotname) {
@@ -939,13 +1394,10 @@ int ngSpice_UnlockRealloc(void)
 /* Library constructor/destructor                                     */
 /* ------------------------------------------------------------------ */
 
-static void cleanup_membuf_dir(void)
+static void cleanup_csv_file(void)
 {
-    if (membuf_path[0]) {
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd), "rm -rf %s", membuf_path);
-        if (system(cmd) != 0) { /* best effort */ }
-    }
+    if (csv_outpath[0])
+        unlink(csv_outpath);
 }
 
 __attribute__((destructor))
@@ -961,5 +1413,5 @@ static void shim_cleanup(void)
     clear_all_plots();
     if (netlist_tmpfile[0])
         unlink(netlist_tmpfile);
-    cleanup_membuf_dir();
+    cleanup_csv_file();
 }

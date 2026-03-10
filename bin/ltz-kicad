@@ -33,10 +33,11 @@ if [ ! -f "$XYCE_LIB/libxyce.so" ]; then
     exit 1
 fi
 
-# LD_PRELOAD forces our shim to be loaded before the system libngspice.
-# KiCad's dlopen("libngspice.so.0") will find our symbols already present.
-export LD_PRELOAD="$SHIM_DIR/libngspice.so.0.0.0${LD_PRELOAD:+ $LD_PRELOAD}"
-export LD_LIBRARY_PATH="$XYCE_LIB:$XYCE_CINT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# KiCad uses dlopen("libngspice.so.0") + dlsym(handle, ...) to load ngspice.
+# LD_PRELOAD doesn't help because dlsym resolves against the specific handle.
+# Instead, put our shim dir first in LD_LIBRARY_PATH so dlopen finds ours
+# before the system /usr/lib/x86_64-linux-gnu/libngspice.so.0.
+export LD_LIBRARY_PATH="$SHIM_DIR:$XYCE_LIB:$XYCE_CINT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Parse args
 CMD=kicad
