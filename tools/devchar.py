@@ -557,11 +557,70 @@ Va a 0 0
     return sweeps
 
 
+def gen_darlington_sweeps(card: ModelCard) -> Dict[str, str]:
+    """Generate characterization netlists for a Darlington pair.
+
+    Uses the BJT model card for both transistors.
+    """
+    model_line = card.raw_line
+    # Darlington β ≈ β², so much lower Ib needed
+    sweeps = {}
+
+    sweeps['ic_vce'] = f"""{card.name} Darlington IC vs VCE
+Q1 c b mid 0 {card.name}
+Q2 c mid 0 0 {card.name}
+Vce c 0 0
+Ib 0 b 0
+{model_line}
+.dc Vce 0 5 0.05 Ib 1n 100n 10n
+.print DC I(Vce) V(c) V(b) I(Ib)
+.end
+"""
+
+    sweeps['ic_vbe'] = f"""{card.name} Darlington IC vs VBE
+Q1 c b mid 0 {card.name}
+Q2 c mid 0 0 {card.name}
+Vce c 0 0
+Vbe b 0 0
+{model_line}
+.dc Vbe 0 2.0 0.01 Vce 0.5 5 0.5
+.print DC I(Vce) V(b) V(c)
+.end
+"""
+
+    return sweeps
+
+
+def gen_mirror_sweeps(card: ModelCard) -> Dict[str, str]:
+    """Generate characterization netlists for a current mirror pair."""
+    model_line = card.raw_line
+    pnp = card.polarity == 'p'
+    sign = -1 if pnp else 1
+
+    sweeps = {}
+
+    # Mirror ratio: Iout vs Iref at various Vce_out
+    sweeps['iout_iref'] = f"""{card.name} Mirror Iout vs Iref
+Q1 cref cref 0 0 {card.name}
+Q2 cout cref 0 0 {card.name}
+Vce cout 0 2.5
+Iref 0 cref 0
+{model_line}
+.dc Iref 0 {sign * 1e-3} {sign * 10e-6} Vce {sign * 0.5} {sign * 5} {sign * 0.5}
+.print DC I(Vce) I(Iref) V(cref) V(cout)
+.end
+"""
+
+    return sweeps
+
+
 SWEEP_GENERATORS = {
     'VDMOS': gen_vdmos_sweeps,
     'NPN': gen_bjt_sweeps,
     'PNP': gen_bjt_sweeps,
     'D': gen_diode_sweeps,
+    'DARLINGTON': gen_darlington_sweeps,
+    'MIRROR': gen_mirror_sweeps,
 }
 
 
@@ -1186,10 +1245,160 @@ void vae_jacobian(VaeState* Vs, double* dFdV, double* dQdV)
 """
 
 
+def emit_darlington_so_source(db: sqlite3.Connection, model_name: str) -> str:
+    """Generate C++ for a Darlington table-model .so.
+
+    Uses IC vs VCE sweep data as a 2D lookup table.
+    Nodes: V[0]=c, V[1]=b, V[2]=e (3 terminals, no internal nodes).
+    """
+    row = db.execute(
+        "SELECT params, polarity FROM models WHERE name=?",
+        (model_name,)
+    ).fetchone()
+    if not row:
+        raise ValueError(f"Model {model_name} not found")
+
+    params = json.loads(row[0])
+
+    sweep = db.execute(
+        "SELECT columns, data, n_points FROM sweeps "
+        "WHERE model=? AND sweep_type='ic_vce'",
+        (model_name,)
+    ).fetchone()
+    if not sweep:
+        raise ValueError(f"No ic_vce sweep data for {model_name}")
+
+    columns = json.loads(sweep[0])
+    data = list(struct.iter_unpack(f'<{len(columns)}d', sweep[1]))
+
+    # Build table: Ic(Ib, Vce)
+    # Columns: I(Vce), V(c), V(b), I(Ib)
+    ib_vals = sorted(set(abs(r[3]) for r in data if len(r) > 3))
+    vce_vals = sorted(set(abs(r[1]) for r in data))
+
+    ic_table = {}
+    for r in data:
+        if len(r) < 4:
+            continue
+        ic = abs(r[0])
+        vce = abs(r[1])
+        ib = abs(r[3])
+        ic_table[(ib, vce)] = ic
+
+    # Subsample
+    max_ib, max_vce = 16, 64
+    if len(ib_vals) > max_ib:
+        step = max(1, len(ib_vals) // max_ib)
+        ib_vals = ib_vals[::step]
+    if len(vce_vals) > max_vce:
+        step = max(1, len(vce_vals) // max_vce)
+        vce_vals = vce_vals[::step]
+
+    n_ib = len(ib_vals)
+    n_vce = len(vce_vals)
+
+    def get_ic(ib, vce):
+        return ic_table.get((ib, vce), 0.0)
+
+    return f"""// {model_name} — Darlington table model
+// {n_ib} x {n_vce} Ic(Ib, Vce) bilinear interpolation
+// Nodes: V[0]=c, V[1]=b, V[2]=e
+
+#include <cstring>
+#include <cmath>
+
+struct VaeState {{ double V[16]; double Vt; }};
+
+static const int N_IB = {n_ib};
+static const int N_VCE = {n_vce};
+
+static const double ib_bp[{n_ib}] = {{
+    {', '.join(f'{v:.8e}' for v in ib_vals)}
+}};
+
+static const double vce_bp[{n_vce}] = {{
+    {', '.join(f'{v:.8e}' for v in vce_vals)}
+}};
+
+static const double ic_tbl[{n_ib}][{n_vce}] = {{
+{chr(10).join('    { ' + ', '.join(f'{get_ic(ib,vce):.8e}' for vce in vce_vals) + ' },' for ib in ib_vals)}
+}};
+
+static double interp2d(double x, double y,
+    const double* xbp, int nx, const double* ybp, int ny, const double* tbl)
+{{
+    int ix = 0;
+    if (x <= xbp[0]) ix = 0;
+    else if (x >= xbp[nx-1]) ix = nx - 2;
+    else {{ while (ix < nx-2 && xbp[ix+1] < x) ix++; }}
+    int iy = 0;
+    if (y <= ybp[0]) iy = 0;
+    else if (y >= ybp[ny-1]) iy = ny - 2;
+    else {{ while (iy < ny-2 && ybp[iy+1] < y) iy++; }}
+    double fx = (x - xbp[ix]) / (xbp[ix+1] - xbp[ix] + 1e-30);
+    double fy = (y - ybp[iy]) / (ybp[iy+1] - ybp[iy] + 1e-30);
+    if (fx < 0) fx = 0; if (fx > 1) fx = 1;
+    if (fy < 0) fy = 0; if (fy > 1) fy = 1;
+    double v00 = tbl[ix*ny+iy], v01 = tbl[ix*ny+iy+1];
+    double v10 = tbl[(ix+1)*ny+iy], v11 = tbl[(ix+1)*ny+iy+1];
+    return v00*(1-fx)*(1-fy) + v10*fx*(1-fy) + v01*(1-fx)*fy + v11*fx*fy;
+}}
+
+extern "C" {{
+
+int vae_n_nodes() {{ return 3; }}
+int vae_n_branches() {{ return 3; }}
+
+void vae_eval(VaeState* s, double* F, double* Q)
+{{
+    double Vc = s->V[0], Vb = s->V[1], Ve = s->V[2];
+    double Vbe = Vb - Ve;
+    double Vce = Vc - Ve;
+    double vt = s->Vt;
+
+    // Estimate Ib from Vbe using exponential approximation
+    // Ib ≈ IS/BF * exp(Vbe/Vt) for Darlington
+    double IS = {params.get('is', 1e-16)};
+    double BF = {params.get('bf', 125.0)};
+    double Ib = IS/BF * (exp(fmin(Vbe/vt, 80.0)) - 1.0);
+    if (Ib < 0) Ib = 0;
+
+    double Ic = interp2d(Ib, fabs(Vce), ib_bp, N_IB, vce_bp, N_VCE, &ic_tbl[0][0]);
+
+    F[0] = Ic;       // collector
+    F[1] = Ib;       // base
+    F[2] = -Ic - Ib; // emitter (KCL)
+
+    memset(Q, 0, 3*sizeof(double));
+}}
+
+void vae_jacobian(VaeState* s, double* dFdV, double* dQdV)
+{{
+    double dv = 1e-6;
+    double F0[3], Q0[3], Fp[3], Qp[3];
+    VaeState sp;
+    memset(dFdV, 0, 9*sizeof(double));
+    memset(dQdV, 0, 9*sizeof(double));
+    vae_eval(s, F0, Q0);
+    for (int j = 0; j < 3; j++) {{
+        sp = *s; sp.V[j] += dv;
+        vae_eval(&sp, Fp, Qp);
+        for (int i = 0; i < 3; i++) {{
+            dFdV[i*3+j] = (Fp[i] - F0[i]) / dv;
+            dQdV[i*3+j] = (Qp[i] - Q0[i]) / dv;
+        }}
+    }}
+}}
+
+}} // extern "C"
+"""
+
+
 SO_EMITTERS = {
     'VDMOS': emit_vdmos_so_source,
     'NPN': emit_bjt_so_source,
     'PNP': emit_bjt_so_source,
+    'DARLINGTON': emit_darlington_so_source,
 }
 
 
