@@ -47,6 +47,8 @@ class LTspiceToXyce:
         self.verbose = verbose
         self.changes: List[str] = []
         self.warnings: List[str] = []
+        self.vdmos_models: dict = {}  # model_name → va_module_name
+        self._used_models: set = set()  # model names referenced by device lines
 
     def log(self, msg: str):
         if self.verbose:
@@ -70,7 +72,13 @@ class LTspiceToXyce:
         lines = self._fix_models(lines)
         lines = self._fix_op_print(lines)
         lines = self._fix_save(lines)
+        # Pre-scan: collect model names referenced by M device lines
+        for line in lines:
+            m = re.match(r'^M\S*\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)', line.strip(), re.I)
+            if m:
+                self._used_models.add(m.group(1).upper())
         lines = self._resolve_includes(lines)
+        lines = self._rewrite_vdmos_devices(lines)
         lines = self._ensure_print(lines)
         lines = self._ensure_end(lines)
         return lines
@@ -474,11 +482,90 @@ class LTspiceToXyce:
                 out.append(line)
         return out
 
+    def _generate_vdmos_va(self, name: str, params: dict, pchan: bool) -> str:
+        """Generate a Verilog-A VDMOS model from parsed LTspice parameters."""
+        vto = abs(params.get('vto', 2.0))
+        kp = params.get('kp', 10.0)
+        lam = params.get('lambda', 0.01)
+        rd = params.get('rd', 0.0)
+        rs = params.get('rs', 0.0)
+        rg = params.get('rg', 0.0)
+        mtriode = params.get('mtriode', 1.0)
+        ksubthres = params.get('ksubthres', 0.1)
+        cgs = params.get('cgs', 0.0)
+        cgdmin = params.get('cgdmin', 0.0)
+        cgdmax = params.get('cgdmax', 0.0)
+        a_cgd = params.get('a', 0.5)
+        cjo = params.get('cjo', 0.0)
+        is_diode = params.get('is', 1e-14)
+        n_diode = params.get('n', 1.0)
+        sign = "-" if pchan else ""
+
+        return f"""`include "disciplines.vams"
+`include "constants.vams"
+module {name}(d, g, s);
+    inout d, g, s;
+    electrical d, g, s;
+    parameter real Vto={vto}; parameter real Kp={kp}; parameter real Lambda={lam};
+    parameter real Mtriode={mtriode}; parameter real Ksubthres={ksubthres};
+    parameter real Cgs_val={cgs}; parameter real Cgdmin={cgdmin};
+    parameter real Cgdmax={cgdmax}; parameter real A_cgd={a_cgd};
+    parameter real Cjo_val={cjo}; parameter real Is_val={is_diode}; parameter real N_val={n_diode};
+    real Vgs, Vds, Ids, Vov, Cgd_val;
+    analog begin
+        Vgs = {"V(s, g)" if pchan else "V(g, s)"};
+        Vds = {"V(s, d)" if pchan else "V(d, s)"};
+        Vov = Vgs - Vto;
+        if (Vov <= 0.0) begin
+            if (Ksubthres > 0.0)
+                Ids = Kp * Ksubthres * Ksubthres * ln(1.0 + exp(Vov / Ksubthres)) * ln(1.0 + exp(Vov / Ksubthres));
+            else Ids = 0.0;
+        end else if (Vds < Vov) begin
+            Ids = Kp * (Vov * Vds - 0.5 * pow(Vds, Mtriode) * pow(Vov, 2.0 - Mtriode)) * (1.0 + Lambda * Vds);
+        end else begin
+            Ids = 0.5 * Kp * Vov * Vov * (1.0 + Lambda * Vds);
+        end
+        I(d, s) <+ {sign}Ids;
+        I(s, d) <+ Is_val * (limexp(V(s, d) / (N_val * $vt)) - 1.0);
+        I(g, s) <+ Cgs_val * ddt(V(g, s));
+        Cgd_val = Cgdmin + (Cgdmax - Cgdmin) / (1.0 + A_cgd * max(0.0, Vds));
+        I(g, d) <+ Cgd_val * ddt(V(g, d));
+        I(d, s) <+ Cjo_val * ddt(V(d, s));
+    end
+endmodule
+"""
+
     def _fix_models(self, lines):
-        """Fix model syntax: empty .model D D, LPNP→PNP, SW→switch."""
+        """Fix model syntax: empty .model D D, LPNP→PNP, VDMOS→VA, SW→switch."""
         out = []
+        vdmos_vas = {}  # name → va_content
         for line in lines:
             s = line.strip()
+
+            # .model X VDMOS(...) → generate Verilog-A, replace with .hdl
+            m = re.match(r'^\.model\s+(\S+)\s+VDMOS\s*\((.+)\)\s*$', s, re.I)
+            if m:
+                mname = m.group(1)
+                params_str = m.group(2)
+                pchan = 'pchan' in params_str.lower()
+                params = {}
+                for pm in re.finditer(r'(\w+)\s*=\s*([^\s,]+)', params_str):
+                    k = pm.group(1).lower()
+                    try:
+                        params[k] = parse_eng(pm.group(2))
+                    except (ValueError, TypeError):
+                        params[k] = pm.group(2)
+                # Use a sanitized module name (no special chars)
+                va_name = f"ltz_vdmos_{re.sub(r'[^a-zA-Z0-9_]', '_', mname)}"
+                va_content = self._generate_vdmos_va(va_name, params, pchan)
+                va_path = Path(self.outdir) / f"{va_name}.va"
+                va_path.write_text(va_content)
+                vdmos_vas[mname] = va_name
+                self.vdmos_models[mname.upper()] = va_name
+                out.append(f'.hdl "{(Path(self.outdir) / (va_name + ".va")).resolve()}"\n')
+                out.append(f'.model {mname} {va_name}\n')
+                self.changes.append(f"VDMOS {mname} → Verilog-A {va_name}.va")
+                continue
 
             # .model D D (empty) → add default params
             if re.match(r'^\.model\s+D\s+D\s*$', s, re.I):
@@ -614,7 +701,101 @@ class LTspiceToXyce:
         content = re.sub(r'^(\.model\s+\S+\s+PNP)\s*$', r'\1(BF=100 IS=1e-14)',
                          content, flags=re.M | re.I)
 
-        dest.write_text(content)
+        # Fix commas in .model params (LTspice allows, Xyce doesn't)
+        content = re.sub(r'(\.\s*model\s+\S+\s+\w+\([^)]*),([^)]*\))',
+                         lambda m: m.group(0).replace(',', ' '),
+                         content, flags=re.I)
+
+        # VDMOS → generate Verilog-A files and replace .model lines
+        lines = content.split('\n')
+        out_lines = []
+        hdl_lines = []  # .hdl directives to prepend
+        for line in lines:
+            # Join continuation lines for .model matching
+            m = re.match(r'^\.model\s+(\S+)\s+VDMOS\b', line, re.I)
+            if m:
+                mname = m.group(1)
+                if mname.upper() not in self._used_models:
+                    out_lines.append(f'* [ltz] unused VDMOS: {mname}')
+                    continue
+                # Extract params from the full line
+                pm = re.match(r'^\.model\s+\S+\s+VDMOS\s*\((.+)\)', line, re.I)
+                if not pm:
+                    out_lines.append(f'* [ltz] malformed VDMOS: {mname}')
+                    continue
+                params_str = pm.group(1)
+                pchan = 'pchan' in params_str.lower()
+                params = {}
+                for pm in re.finditer(r'(\w+)\s*=\s*([^\s,)]+)', params_str):
+                    k = pm.group(1).lower()
+                    if k in ('pchan', 'mfg'):
+                        continue
+                    try:
+                        params[k] = parse_eng(pm.group(2))
+                    except (ValueError, TypeError):
+                        pass
+                va_name = f"ltz_vdmos_{re.sub(r'[^a-zA-Z0-9_]', '_', mname)}"
+                va_content = self._generate_vdmos_va(va_name, params, pchan)
+                va_path = self.outdir / f"{va_name}.va"
+                va_path.write_text(va_content)
+                hdl_lines.append(f'.hdl "{va_path.resolve()}"')
+                out_lines.append(f'.model {mname} {va_name}')
+                self.changes.append(f"VDMOS {mname} → VA {va_name}.va (in lib)")
+            else:
+                out_lines.append(line)
+
+        # Prepend .hdl directives at the top of the file
+        if hdl_lines:
+            out_lines = hdl_lines + out_lines
+
+        dest.write_text('\n'.join(out_lines))
+
+    def _rewrite_vdmos_devices(self, lines):
+        """Rewrite M device lines that reference VDMOS models to Y device lines.
+
+        M_Q1 +V N010 N012 N012 IRFP240  →  Yltz_vdmos_IRFP240 Q1 +V N010 N012 N012 IRFP240
+        """
+        if not self.vdmos_models:
+            # Also check included files for VDMOS models
+            for line in lines:
+                m = re.match(r'^\s*\.include\s+(\S+)', line, re.I)
+                if m:
+                    fname = m.group(1).strip('"')
+                    lib_path = self.outdir / Path(fname).name
+                    if lib_path.exists():
+                        content = lib_path.read_text()
+                        for lm in re.finditer(
+                                r'^\.model\s+(\S+)\s+(ltz_vdmos_\S+)',
+                                content, re.M | re.I):
+                            self.vdmos_models[lm.group(1).upper()] = lm.group(2)
+
+        if not self.vdmos_models:
+            return lines
+
+        out = []
+        for line in lines:
+            s = line.strip()
+            # Match M device lines: M<name> n1 n2 n3 [n4] modelname [params]
+            m = re.match(r'^M[\w_]*\s+', s, re.I)
+            if m:
+                parts = s.split()
+                inst = parts[0]  # M_Q1 or MQ1
+                # Find the model name (first non-node, non-param token after nodes)
+                # MOSFET has 4 nodes: d g s b
+                if len(parts) >= 6:
+                    model = parts[5] if not '=' in parts[5] else parts[4]
+                    model_upper = model.upper()
+                    if model_upper in self.vdmos_models:
+                        va_mod = self.vdmos_models[model_upper]
+                        # Strip M prefix for Y instance name
+                        yname = re.sub(r'^M[_]?', '', inst, flags=re.I) or inst
+                        nodes = ' '.join(parts[1:5])
+                        params = ' '.join(parts[6:]) if len(parts) > 6 else ''
+                        params_str = f' {params}' if params else ''
+                        line = f'Y{va_mod.upper()} {yname} {nodes} {model}{params_str}\n'
+                        self.changes.append(f"VDMOS device {inst} → Y{va_mod.upper()}")
+            out.append(line)
+        return out
 
     def _ensure_print(self, lines):
         """Add .PRINT if missing, or fix mismatched .PRINT type."""
