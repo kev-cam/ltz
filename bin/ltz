@@ -219,9 +219,53 @@ sub run {
 #  .cir -> Xyce conversion  (reimplements tools/ltz_convert.py)
 # ===========================================================================
 
+# Normalize a .param argument list to Xyce's name=value form. Accepts LTspice's
+# space-form ("name value name2 value2"), the "=" form, and {brace expressions}
+# (which may contain spaces). Returns the normalized string, or undef if it
+# can't be parsed (caller then leaves the line untouched).
+sub _ltspice_param_to_xyce {
+    my ($args) = @_;
+    my @out;
+    while (1) {
+        $args =~ s/^[\s,]+//;
+        last unless length $args;
+        my $name;
+        if    ($args =~ s/^([A-Za-z_]\w*)\s*=\s*//) { $name = $1; }   # name= value
+        elsif ($args =~ s/^([A-Za-z_]\w*)\s+//)     { $name = $1; }   # name  value
+        elsif ($args =~ s/^([A-Za-z_]\w*)\s*$//)    { push @out, $1; last; }  # trailing lone name
+        else { return undef; }
+        my $val = _take_param_value(\$args);
+        return undef unless defined $val && length $val;
+        push @out, "$name=$val";
+    }
+    return @out ? join(' ', @out) : undef;
+}
+
+# Pull one value token off the front of $$ref: a balanced {…} expression or a
+# whitespace-delimited bareword.
+sub _take_param_value {
+    my ($ref) = @_;
+    $$ref =~ s/^\s+//;
+    return undef unless length $$ref;
+    if ($$ref =~ /^\{/) {
+        my ($depth, $i) = (0, 0);
+        while ($i < length $$ref) {
+            my $c = substr($$ref, $i, 1);
+            $depth++ if $c eq '{';
+            $depth-- if $c eq '}';
+            $i++;
+            last if $depth == 0;
+        }
+        my $v = substr($$ref, 0, $i, '');
+        return $v;
+    }
+    $$ref =~ s/^(\S+)//;
+    return $1;
+}
+
 sub convert_cir_file {
-    my ($inpath, $outpath) = @_;
-    verbose("Converting $inpath -> $outpath");
+    my ($inpath, $outpath, $is_include) = @_;
+    verbose("Converting $inpath -> $outpath" . ($is_include ? " (include)" : ""));
 
     open my $fh, '<', $inpath or die "ltz: cannot read $inpath: $!\n";
     my @lines = <$fh>;
@@ -233,11 +277,31 @@ sub convert_cir_file {
     my $lib_path = (!$opt_no_lib) ? find_lib_path() : undef;
     my ($out_ref, $changes_ref, $warnings_ref) = cir_to_xyce(\@lines, $lib_path);
 
-    # Auto-include bundled model library
-    if ($lib_path) {
+    # Auto-include bundled model library (top-level netlist only)
+    if ($lib_path && !$is_include) {
         verbose("Including model library: $lib_path");
         # Insert .INCLUDE after the title line (first line)
         splice @$out_ref, 1, 0, ".INCLUDE $lib_path\n";
+    }
+
+    # Recursively translate .include/.inc/.lib targets: Xyce resolves relative
+    # includes against cwd (the original LTspice dir), so the bundled .lib/.meas
+    # would reach Xyce untranslated (space-form .param, LTspice .meas, ...).
+    # Translate each into the output dir and repoint the directive at it.
+    {
+        my $indir  = dirname($inpath);
+        my $outdir = dirname($outpath);
+        for my $ln (@$out_ref) {
+            next unless $ln =~ /^(\s*\.(?:include|inc|lib)\s+)(\S+)(.*)$/i;
+            my ($pre, $f, $post) = ($1, $2, $3);
+            $f =~ s/^["']|["']$//g;
+            next if $f =~ /[\\]/ || File::Spec->file_name_is_absolute($f);
+            my $src = File::Spec->catfile($indir, $f);
+            next unless -f $src;
+            my $tgt = File::Spec->catfile($outdir, basename($f) . ".xyce");
+            convert_cir_file($src, $tgt, 1);          # recurse (translate the include)
+            $ln = "$pre\"$tgt\"$post\n";
+        }
     }
 
     my $odir = dirname($outpath);
@@ -352,6 +416,21 @@ sub cir_to_xyce {
             next;
         }
 
+        # .param: LTspice accepts space-form ".param name value [name value...]";
+        # Xyce requires "name=value". Normalize (brace-expression aware).
+        if ($stripped =~ /^\.param\s+(.+)/i) {
+            my $args = $1;
+            my $comment = ($args =~ s/\s*;(.*)$//) ? " ;$1" : '';   # strip inline ; comment
+            my $conv = _ltspice_param_to_xyce($args);
+            if (defined $conv) {
+                push @changes, "L$lineno: .param -> name=value form" if $conv ne $args;
+                push @output, ".param $conv$comment\n";
+                next;
+            }
+            push @output, $line;   # unparseable — leave as-is
+            next;
+        }
+
         # .PLOT with args -> .PRINT
         if ($stripped =~ /^\.PLOT\s+(.+)/i) {
             my $args = $1;
@@ -361,13 +440,14 @@ sub cir_to_xyce {
             next;
         }
 
-        # .meas -> .MEASURE
+        # .meas: LTspice .meas syntax (WHEN mag()=, FIND..AT, PARAM{}) doesn't
+        # map cleanly onto Xyce .MEASURE and aborts the run. These are
+        # post-processing measurements, not needed for the waveform .raw, so
+        # comment them out — the simulation proceeds and the .raw is produced.
+        # (TODO: a real .meas->.MEASURE translator for the cases Xyce supports.)
         if ($upper =~ /^\.MEAS[\s\t]/) {
-            (my $converted = $stripped) =~ s/^\.meas/.MEASURE/i;
-            $converted =~ s/\bFrom\b/FROM/g;
-            $converted =~ s/\bto\b/TO/g;
-            push @changes, "L$lineno: .meas -> .MEASURE";
-            push @output, "$converted\n";
+            push @changes, "L$lineno: .meas commented out (Xyce .MEASURE incompatible)";
+            push @output, "* [ltz] .meas (not translated): $stripped\n";
             next;
         }
 
