@@ -1,0 +1,45 @@
+* OPAMP MACRO MODEL, SINGLE-POLE
+*-----------------------------------------------------------------------------
+*Parameters: User input
+*-----------------------------------------------------------------------------
+*Diff amp
+.param p_rin 		10MEG 				; High impedance
+.param p_Egain 		100k				; DC GAIN=100K
+
+*Gain and 1st Pole
+.param p_cp1		1.5915uF
+.param p_fp1		100					; POLE1=100HZ
+.param cal_Fu		{p_fp1*p_Egain} 	; UNITY GAIN (0db) = DCGAIN X POLE1 = 10MHZ
+
+*Output Buffer
+.param p_Ebuffer	1
+.param p_rout		10
+
+*Calculation base in Fu
+*.param fu = 50 MHz.
+*.param cal_fp1 	{fu / p_Egain}  ;  500 Hz
+*.param p_rp1 		{1/( 2 * π * 1.5915uF * 500 Hz)}  ; Resistor calculation
+
+*-----------------------------------------------------------------------------
+*Parameters: Automatic Calculation
+*-----------------------------------------------------------------------------
+.param p_rp1		{1/(2*pi*p_fp1*p_cp1)} ; Resistance of LPF, first pole
+*-----------------------------------------------------------------------------
+*Subcircuit: OP AMP BASIC Mode;
+*-----------------------------------------------------------------------------
+* connections:      non-inverting input
+*                   |   inverting input
+*                   |   |   output
+*                   |   |   |
+.SUBCKT OPAMP1	    1   2   6
+* INPUT IMPEDANCE
+*Diff amp
+RIN		1	2			{p_rin}
+EGAIN	3 	0	1 	2	{p_Egain}
+*Gain and 1st Pole
+RP1		3	4			{p_rp1}
+CP1		4	0			{p_cp1}
+* OUTPUT BUFFER AND RESISTANCE
+EBUFFER	5 	0	4 	0	{p_Ebuffer}
+ROUT	5	6			{p_rout}
+.ENDS
