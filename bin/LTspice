@@ -1,0 +1,36 @@
+#!/usr/bin/env perl
+#
+# LTspice — drop-in LTspice replacement that runs the circuit through Xyce
+# (via ltz, which translates with ltspice2xyce.pl). Put this directory on PATH
+# ahead of the real LTspice and anything that shells out to LTspice in batch
+# mode will simulate with Xyce instead.
+#
+# Maps LTspice's batch CLI onto ltz:
+#   LTspice -b [-ascii] [-Run] circuit.{asc,cir,net}   ->  ltz -b [-ascii] file
+#   LTspice -netlist circuit                            ->  ltz -netlist file
+# Other LTspice-only flags (-Run, -SOI, -wine, …) are ignored; GUI invocations
+# (no -b/-netlist) are rejected — this stand-in is batch-only.
+#
+use strict;
+use warnings;
+use Cwd qw(abs_path);
+use File::Basename qw(dirname);
+
+my $ltz = dirname(abs_path($0)) . '/ltz';
+die "LTspice(shim): ltz not found next to me ($ltz)\n" unless -x $ltz;
+
+my (@pass, $file, $batch, $netlist);
+for my $a (@ARGV) {
+    if    ($a =~ /^-b$/i)       { $batch = 1; }
+    elsif ($a =~ /^-ascii$/i)   { push @pass, '-ascii'; }
+    elsif ($a =~ /^-netlist$/i) { $netlist = 1; }
+    elsif ($a =~ /^-/)          { next; }            # ignore LTspice-only flags (-Run, …)
+    else                        { $file = $a; }
+}
+
+die "LTspice(shim): no input file\n" unless defined $file;
+die "LTspice(shim): GUI mode not supported — use -b (batch) or -netlist\n"
+    unless $batch || $netlist;
+
+unshift @pass, ($netlist ? '-netlist' : '-b');
+exec $^X, $ltz, @pass, $file;

@@ -181,7 +181,18 @@ sub run {
         $xyce_cir = File::Spec->catfile($tmpdir, "${name}.xyce.cir");
     }
 
-    convert_cir_file($netlist_file, $xyce_cir);
+    # Translate LTspice -> Xyce via the standalone front-end ltspice2xyce.pl
+    # (the canonical translator, shared with any LTspice-replacement shim).
+    {
+        my $lib = (!$opt_no_lib) ? find_lib_path() : undef;
+        my $l2x = find_ltspice2xyce();
+        my @cmd = ($^X, $l2x, '-o', $xyce_cir, $netlist_file);
+        push @cmd, '--lib', $lib if $lib;
+        push @cmd, '-v' if $opt_verbose;
+        verbose("Translating: @cmd");
+        system(@cmd) == 0
+            or die "ltz: ltspice2xyce.pl failed (rc=" . ($? >> 8) . ")\n";
+    }
 
     if ($opt_netlist) {
         print "ltz: wrote netlist: $xyce_cir\n";
@@ -213,394 +224,6 @@ sub run {
     my $rc = $? >> 8;
     verbose("Xyce exited with code $rc");
     return $rc;
-}
-
-# ===========================================================================
-#  .cir -> Xyce conversion  (reimplements tools/ltz_convert.py)
-# ===========================================================================
-
-# Normalize a .param argument list to Xyce's name=value form. Accepts LTspice's
-# space-form ("name value name2 value2"), the "=" form, and {brace expressions}
-# (which may contain spaces). Returns the normalized string, or undef if it
-# can't be parsed (caller then leaves the line untouched).
-sub _ltspice_param_to_xyce {
-    my ($args) = @_;
-    my @out;
-    while (1) {
-        $args =~ s/^[\s,]+//;
-        last unless length $args;
-        my $name;
-        if    ($args =~ s/^([A-Za-z_]\w*)\s*=\s*//) { $name = $1; }   # name= value
-        elsif ($args =~ s/^([A-Za-z_]\w*)\s+//)     { $name = $1; }   # name  value
-        elsif ($args =~ s/^([A-Za-z_]\w*)\s*$//)    { push @out, $1; last; }  # trailing lone name
-        else { return undef; }
-        my $val = _take_param_value(\$args);
-        return undef unless defined $val && length $val;
-        push @out, "$name=$val";
-    }
-    return @out ? join(' ', @out) : undef;
-}
-
-# Pull one value token off the front of $$ref: a balanced {…} expression or a
-# whitespace-delimited bareword.
-sub _take_param_value {
-    my ($ref) = @_;
-    $$ref =~ s/^\s+//;
-    return undef unless length $$ref;
-    if ($$ref =~ /^\{/) {
-        my ($depth, $i) = (0, 0);
-        while ($i < length $$ref) {
-            my $c = substr($$ref, $i, 1);
-            $depth++ if $c eq '{';
-            $depth-- if $c eq '}';
-            $i++;
-            last if $depth == 0;
-        }
-        my $v = substr($$ref, 0, $i, '');
-        return $v;
-    }
-    $$ref =~ s/^(\S+)//;
-    return $1;
-}
-
-sub convert_cir_file {
-    my ($inpath, $outpath, $is_include) = @_;
-    verbose("Converting $inpath -> $outpath" . ($is_include ? " (include)" : ""));
-
-    open my $fh, '<', $inpath or die "ltz: cannot read $inpath: $!\n";
-    my @lines = <$fh>;
-    close $fh;
-
-    # Strip \r for Windows-origin files
-    s/\r\n?/\n/ for @lines;
-
-    my $lib_path = (!$opt_no_lib) ? find_lib_path() : undef;
-    my ($out_ref, $changes_ref, $warnings_ref) = cir_to_xyce(\@lines, $lib_path);
-
-    # Auto-include bundled model library (top-level netlist only)
-    if ($lib_path && !$is_include) {
-        verbose("Including model library: $lib_path");
-        # Insert .INCLUDE after the title line (first line)
-        splice @$out_ref, 1, 0, ".INCLUDE $lib_path\n";
-    }
-
-    # Recursively translate .include/.inc/.lib targets: Xyce resolves relative
-    # includes against cwd (the original LTspice dir), so the bundled .lib/.meas
-    # would reach Xyce untranslated (space-form .param, LTspice .meas, ...).
-    # Translate each into the output dir and repoint the directive at it.
-    {
-        my $indir  = dirname($inpath);
-        my $outdir = dirname($outpath);
-        for my $ln (@$out_ref) {
-            next unless $ln =~ /^(\s*\.(?:include|inc|lib)\s+)(\S+)(.*)$/i;
-            my ($pre, $f, $post) = ($1, $2, $3);
-            $f =~ s/^["']|["']$//g;
-            next if $f =~ /[\\]/ || File::Spec->file_name_is_absolute($f);
-            my $src = File::Spec->catfile($indir, $f);
-            next unless -f $src;
-            my $tgt = File::Spec->catfile($outdir, basename($f) . ".xyce");
-            convert_cir_file($src, $tgt, 1);          # recurse (translate the include)
-            $ln = "$pre\"$tgt\"$post\n";
-        }
-    }
-
-    my $odir = dirname($outpath);
-    if ($odir && !-d $odir) {
-        require File::Path;
-        File::Path::make_path($odir);
-    }
-
-    open my $ofh, '>', $outpath or die "ltz: cannot write $outpath: $!\n";
-    print $ofh @$out_ref;
-    close $ofh;
-
-    verbose(sprintf "Conversion: %d changes, %d warnings",
-        scalar @$changes_ref, scalar @$warnings_ref);
-    if ($opt_verbose) {
-        for (@$changes_ref)  { verbose("  change: $_") }
-        for (@$warnings_ref) { verbose("  warn:   $_") }
-    }
-}
-
-sub cir_to_xyce {
-    my ($lines_ref, $lib_path) = @_;
-    my @output;
-    my @changes;
-    my @warnings;
-    my $has_end   = 0;
-    my $has_print = 0;
-    my $analysis_type;
-    my %diode_models_used;     # model names referenced by D devices
-    my %models_defined;        # model names defined by .model statements
-
-    # First pass: detect analysis type, track models
-    for my $line (@$lines_ref) {
-        my $u = uc($line);
-        if    ($u =~ /^\s*\.TRAN\b/) { $analysis_type = 'TRAN' }
-        elsif ($u =~ /^\s*\.AC\b/)   { $analysis_type = 'AC' }
-        elsif ($u =~ /^\s*\.DC\b/)   { $analysis_type = 'DC' }
-        elsif ($u =~ /^\s*\.OP\b/)   { $analysis_type = 'DC' }
-        elsif ($u =~ /^\s*\.TF\b/)   { $analysis_type = 'DC' }
-
-        # Track diode instance model references: D<name> <n+> <n-> <model>
-        if ($line =~ /^\s*D\S*\s+\S+\s+\S+\s+(\S+)/i) {
-            $diode_models_used{$1} = 1;
-        }
-        # Track .model definitions
-        if ($line =~ /^\s*\.MODEL\s+(\S+)\s/i) {
-            $models_defined{$1} = 1;
-        }
-    }
-
-    # Second pass: convert
-    my $lineno = 0;
-    for my $line (@$lines_ref) {
-        $lineno++;
-        (my $stripped = $line) =~ s/^\s+|\s+$//g;
-        my $upper = uc($stripped);
-
-        # Preserve empty lines
-        unless (length $stripped) {
-            push @output, $line;
-            next;
-        }
-
-        # .PROBE removal
-        if ($upper eq '.PROBE' || $upper =~ /^\.PROBE\s/) {
-            push @changes, "L$lineno: Removed .PROBE";
-            push @output, "* [ltz] removed: $stripped\n";
-            next;
-        }
-
-        # Bare .PLOT removal
-        if ($upper eq '.PLOT') {
-            push @changes, "L$lineno: Removed bare .PLOT";
-            push @output, "* [ltz] removed: $stripped\n";
-            next;
-        }
-
-        # .BACKANNO removal
-        if ($upper =~ /^\.BACKANNO/) {
-            push @changes, "L$lineno: Removed .BACKANNO";
-            push @output, "* [ltz] removed: $stripped\n";
-            next;
-        }
-
-        # .LIB with Windows paths
-        if ($upper =~ /^\.LIB\b/ && $stripped =~ /\\/) {
-            push @warnings, "L$lineno: Windows .lib path removed: $stripped";
-            push @output, "* [ltz] removed Windows path: $stripped\n";
-            next;
-        }
-
-        # .INCLUDE/.INC handling
-        if ($upper =~ /^\.(?:INCLUDE|INC)\b/) {
-            my ($inc_file) = $stripped =~ /^\S+\s+(.*)/;
-            $inc_file //= '';
-            if ($inc_file =~ /\\/) {
-                push @warnings, "L$lineno: Windows .include path: $stripped";
-                push @output, "* [ltz] removed Windows path: $stripped\n";
-            } else {
-                push @warnings, "L$lineno: .include dependency: $inc_file";
-                push @output, $line;
-            }
-            next;
-        }
-
-        # Empty diode model -> add default params
-        if ($stripped =~ /^\.model\s+(\S+)\s+D\s*$/i) {
-            my $mname = $1;
-            push @warnings, "L$lineno: Empty diode model '$mname' -- Xyce needs parameters";
-            push @changes, "L$lineno: Added default diode params to .model $mname";
-            push @output, ".model $mname D(IS=2.52e-9 RS=0.568 N=1.752 BV=100 IBV=100u)\n";
-            next;
-        }
-
-        # .param: LTspice accepts space-form ".param name value [name value...]";
-        # Xyce requires "name=value". Normalize (brace-expression aware).
-        if ($stripped =~ /^\.param\s+(.+)/i) {
-            my $args = $1;
-            my $comment = ($args =~ s/\s*;(.*)$//) ? " ;$1" : '';   # strip inline ; comment
-            my $conv = _ltspice_param_to_xyce($args);
-            if (defined $conv) {
-                push @changes, "L$lineno: .param -> name=value form" if $conv ne $args;
-                push @output, ".param $conv$comment\n";
-                next;
-            }
-            push @output, $line;   # unparseable — leave as-is
-            next;
-        }
-
-        # .PLOT with args -> .PRINT
-        if ($stripped =~ /^\.PLOT\s+(.+)/i) {
-            my $args = $1;
-            push @changes, "L$lineno: .PLOT -> .PRINT";
-            push @output, ".PRINT $args\n";
-            $has_print = 1;
-            next;
-        }
-
-        # .meas: LTspice .meas syntax (WHEN mag()=, FIND..AT, PARAM{}) doesn't
-        # map cleanly onto Xyce .MEASURE and aborts the run. These are
-        # post-processing measurements, not needed for the waveform .raw, so
-        # comment them out — the simulation proceeds and the .raw is produced.
-        # (TODO: a real .meas->.MEASURE translator for the cases Xyce supports.)
-        if ($upper =~ /^\.MEAS[\s\t]/) {
-            push @changes, "L$lineno: .meas commented out (Xyce .MEASURE incompatible)";
-            push @output, "* [ltz] .meas (not translated): $stripped\n";
-            next;
-        }
-
-        # .func: ^ -> **
-        if ($upper =~ /^\.FUNC/) {
-            if ($stripped =~ /\^/) {
-                (my $converted = $stripped) =~ s/\^/**/g;
-                push @changes, "L$lineno: Replaced ^ with ** in .func";
-                push @output, "$converted\n";
-            } else {
-                push @output, $line;
-            }
-            next;
-        }
-
-        # .tran: LTspice allows single-arg ".tran <Tstop>", Xyce needs ".TRAN <Tstep> <Tstop>"
-        # Also handles .tran 0 <tstop> ... where step=0 means "auto" in LTspice
-        # Also handles trailing "uic" keyword and "startup" keyword
-        if ($upper =~ /^\.TRAN\s/) {
-            # Strip trailing UIC/startup keywords (Xyce uses .IC separately)
-            my $tran_line = $stripped;
-            my $has_uic = ($tran_line =~ s/\s+(?:uic|startup)\s*$//i);
-            my @fields = split /\s+/, $tran_line;
-            if (@fields == 2) {
-                # Single arg: .tran <Tstop> -> .TRAN <Tstop/1000> <Tstop>
-                my $tstop = $fields[1];
-                my $tstop_val = _parse_eng($tstop);
-                if (defined $tstop_val && $tstop_val > 0) {
-                    my $tstep = $tstop_val / 1000;
-                    push @changes, "L$lineno: .tran $tstop -> .TRAN $tstep $tstop (added step size)";
-                    push @output, ".TRAN $tstep $tstop\n";
-                } else {
-                    push @output, "$tran_line\n";
-                }
-            } elsif (@fields >= 3) {
-                # Multi-arg: .tran <tstep> <tstop> [tstart] [tmax]
-                # If tstep is 0, auto-calculate from tstop
-                my $tstep_val = _parse_eng($fields[1]);
-                my $tstop_val = _parse_eng($fields[2]);
-                if (defined $tstep_val && $tstep_val == 0 && defined $tstop_val && $tstop_val > 0) {
-                    my $new_tstep = $tstop_val / 1000;
-                    my $new_line = ".TRAN $new_tstep $fields[2]";
-                    push @changes, "L$lineno: .tran step=0 -> .TRAN step=$new_tstep";
-                    push @output, "$new_line\n";
-                } else {
-                    push @output, "$tran_line\n";
-                }
-            } else {
-                push @output, "$tran_line\n";
-            }
-            push @changes, "L$lineno: Removed UIC keyword" if $has_uic;
-            next;
-        }
-
-        # Track .PRINT
-        if ($upper =~ /^\.PRINT/) {
-            $has_print = 1;
-            push @output, $line;
-            next;
-        }
-
-        # Track .END
-        if ($upper eq '.END') {
-            $has_end = 1;
-            push @output, $line;
-            next;
-        }
-
-        # --- Non-exclusive pre-processing (modifies $stripped in-place) ---
-        my $modified = 0;
-
-        # Strip Rser= inline parameter on source lines (LTspice-specific)
-        if ($stripped =~ /^[VI]\S*\s/i && $stripped =~ /\bRser=/i) {
-            $stripped =~ s/\s+Rser=\S+//ig;
-            push @changes, "L$lineno: Stripped Rser= from source";
-            $modified = 1;
-        }
-
-        # British notation: 4n7 -> 4.7n, 2k2 -> 2.2k, 1u5 -> 1.5u etc.
-        if ($stripped =~ s/\b(\d+)([pnumkMG])(\d+)\b/$1.$3$2/g) {
-            push @changes, "L$lineno: British notation -> decimal";
-            $modified = 1;
-        }
-
-        # --- Exclusive transformations (with next) ---
-
-        # ; line comments -> * comments
-        if ($stripped =~ /^;(.*)/) {
-            push @changes, "L$lineno: ; comment -> * comment";
-            push @output, "* $1\n";
-            next;
-        }
-
-        # SINE( -> SIN( (LTspice uses SINE, standard SPICE/Xyce uses SIN)
-        if ($stripped =~ /\bSINE\s*\(/i) {
-            (my $converted = $stripped) =~ s/\bSINE\s*\(/SIN(/ig;
-            push @changes, "L$lineno: SINE( -> SIN(";
-            push @output, "$converted\n";
-            next;
-        }
-
-        # µ (micro sign) -> u (ASCII) for engineering notation
-        # Handle both Latin-1 (0xB5) and UTF-8 (0xC2 0xB5) encodings
-        if ($stripped =~ /\xb5|\xc2\xb5/) {
-            (my $converted = $stripped) =~ s/\xc2\xb5/u/g;
-            $converted =~ s/\xb5/u/g;
-            push @changes, "L$lineno: µ -> u";
-            push @output, "$converted\n";
-            next;
-        }
-
-        # Pass-through
-        push @output, $modified ? "$stripped\n" : $line;
-    }
-
-    # Post-processing
-    if (!$has_print && $analysis_type) {
-        push @warnings,
-            "No .PRINT statement -- Xyce needs explicit output specification";
-    }
-    # Add generic .model for diodes with no model definition
-    # Skip if bundled library is being included (it provides standard models)
-    my @missing_models;
-    if (!$lib_path) {
-        for my $mname (sort keys %diode_models_used) {
-            next if $models_defined{$mname};
-            next if $mname =~ /^D$/i;
-            next if $mname =~ /^\{/;
-            push @missing_models, $mname;
-        }
-    }
-    if (@missing_models) {
-        # Insert before .END
-        my @pre_end;
-        my $end_line;
-        if ($has_end) {
-            $end_line = pop @output;  # remove .END temporarily
-        }
-        for my $mname (@missing_models) {
-            push @pre_end, "* [ltz] auto-generated model for $mname\n";
-            push @pre_end, ".model $mname D(IS=2.52e-9 RS=0.568 N=1.752 BV=100 IBV=100u)\n";
-            push @changes, "Added generic .model for diode $mname";
-        }
-        push @output, @pre_end;
-        push @output, $end_line if defined $end_line;
-    }
-
-    if (!$has_end) {
-        push @output, ".END\n";
-        push @changes, "Added missing .END";
-    }
-
-    return (\@output, \@changes, \@warnings);
 }
 
 # ===========================================================================
@@ -987,6 +610,20 @@ sub find_lib_path {
         return abs_path($p);
     }
     return undef;
+}
+
+# Locate the standalone LTspice->Xyce translator (ltspice2xyce.pl).
+sub find_ltspice2xyce {
+    my @search = (
+        $ENV{LTSPICE2XYCE},
+        File::Spec->catfile($REPO_ROOT, 'tools', 'ltspice2xyce.pl'),
+        '/usr/local/src/xyce/utils/ltspice2xyce.pl',
+        find_in_path('ltspice2xyce.pl'),
+    );
+    for my $p (@search) {
+        return $p if defined $p && length $p && -f $p;
+    }
+    die "ltz: ltspice2xyce.pl not found (set \$LTSPICE2XYCE)\n";
 }
 
 sub find_in_path {
