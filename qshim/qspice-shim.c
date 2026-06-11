@@ -78,23 +78,54 @@ static const char *cmdline_args(void)
     return c;
 }
 
-static DWORD run(const char *cmdline)
+/* Run a child. If stdin_file is non-NULL the child's stdin is that file
+ * (lets both the bridge and a post-failure fallback read the same captured
+ * netlist -- a pipe can only be drained once). */
+static DWORD run(const char *cmdline, const char *stdin_file)
 {
     STARTUPINFOA si; PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof si); si.cb = sizeof si;
-    /* inherit std handles: QUX's netlist pipe and output flow through */
+    HANDLE hin = INVALID_HANDLE_VALUE;
+    if (stdin_file) {
+        SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
+        hin = CreateFileA(stdin_file, GENERIC_READ, FILE_SHARE_READ, &sa,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hin == INVALID_HANDLE_VALUE) {
+            logline("cannot reopen stdin file %s (%lu)", stdin_file, GetLastError());
+            return 127;
+        }
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput  = hin;
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    }
     char *cl = _strdup(cmdline);
-    if (!CreateProcessA(NULL, cl, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+    BOOL ok = CreateProcessA(NULL, cl, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    free(cl);
+    if (hin != INVALID_HANDLE_VALUE) CloseHandle(hin);
+    if (!ok) {
         logline("CreateProcess FAILED (%lu): %s", GetLastError(), cmdline);
-        free(cl);
         return 127;
     }
-    free(cl);
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD rc = 1;
     GetExitCodeProcess(pi.hProcess, &rc);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     return rc;
+}
+
+/* Drain our stdin to a file so it can be replayed for multiple children. */
+static int capture_stdin(const char *path)
+{
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    char buf[65536];
+    DWORD n;
+    while (ReadFile(in, buf, sizeof buf, &n, NULL) && n > 0)
+        fwrite(buf, 1, n, f);
+    fclose(f);
+    return 1;
 }
 
 int main(void)
@@ -125,9 +156,26 @@ int main(void)
             args);
 
     char cmd[8192];
+    DWORD pid = GetCurrentProcessId();
+    char netfile[MAX_PATH];
+    const char *stdin_file = NULL;
+
+    /* a piped netlist can only be drained once: capture it so both the
+     * bridge and a post-failure fallback get the full deck */
+    if (stype == FILE_TYPE_PIPE) {
+        CreateDirectoryA(ARGS_DIR, NULL);
+        snprintf(netfile, sizeof netfile, "%s\\netlist.%lu.cir", ARGS_DIR, pid);
+        if (capture_stdin(netfile)) {
+            stdin_file = netfile;
+            logline("stdin captured -> %s", netfile);
+        } else {
+            logline("stdin capture failed; children inherit the pipe");
+        }
+    }
+
+    DWORD rc = 127;
 
     if (_stricmp(mode, "xyce") == 0) {
-        DWORD pid = GetCurrentProcessId();
         CreateDirectoryA(ARGS_DIR, NULL);
         char afile[MAX_PATH];
         snprintf(afile, sizeof afile, "%s\\%lu.txt", ARGS_DIR, pid);
@@ -137,10 +185,10 @@ int main(void)
             fclose(af);
             snprintf(cmd, sizeof cmd, BRIDGE_CMD_FMT, pid);
             logline("route=xyce: %s (args file %s)", cmd, afile);
-            DWORD rc = run(cmd);
+            rc = run(cmd, stdin_file);
             logline("xyce bridge rc=%lu", rc);
             DeleteFileA(afile);
-            if (rc == 0) return 0;
+            if (rc == 0) goto done;
             logline("bridge failed; falling back to real engine");
         } else {
             logline("cannot write args file %s; falling back", afile);
@@ -150,10 +198,14 @@ int main(void)
     if (GetFileAttributesA(real) == INVALID_FILE_ATTRIBUTES) {
         logline("real engine missing: %s", real);
         fprintf(stderr, "qspice-shim: %s not found\n", real);
-        return 127;
+        rc = 127;
+        goto done;
     }
     snprintf(cmd, sizeof cmd, "\"%s\" %s", real, args);
-    DWORD rc = run(cmd);
+    rc = run(cmd, stdin_file);
     logline("route=passthru rc=%lu", rc);
+
+done:
+    if (stdin_file) DeleteFileA(stdin_file);
     return (int)rc;
 }
