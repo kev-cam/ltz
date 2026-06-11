@@ -114,6 +114,38 @@ static DWORD run(const char *cmdline, const char *stdin_file)
     return rc;
 }
 
+/* QUX learns sim progress/completion from window messages the engine posts
+ * to the -hWnd handle (discovered with qspy.c): msg 0x8100 streams console
+ * text 8 chars at a time (4 LE bytes in wParam + 4 in lParam), terminated by
+ * a (0,0) post; 0x80FF marks the start. Without these QUX treats the run as
+ * dead and never loads the rawfile. */
+static void post_text(HWND hw, const char *s)
+{
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n; i += 8) {
+        unsigned int w = 0, l = 0;
+        size_t left = n - i;
+        memcpy(&w, s + i, left > 4 ? 4 : left);
+        if (left > 4) memcpy(&l, s + i + 4, left - 4 > 4 ? 4 : left - 4);
+        PostMessageA(hw, 0x8100, (WPARAM)w, (LPARAM)l);
+    }
+    PostMessageA(hw, 0x8100, 0, 0);
+}
+
+static void notify_qux(const char *args, double secs)
+{
+    const char *hp = strstr(args, "-hWnd=");
+    if (!hp) return;
+    HWND hw = (HWND)(UINT_PTR)_strtoui64(hp + 6, NULL, 10);
+    if (!hw || !IsWindow(hw)) { logline("hWnd %p not a window; no notify", (void*)hw); return; }
+    PostMessageA(hw, 0x80FF, 0, 0x1C02CE);
+    char banner[256];
+    snprintf(banner, sizeof banner,
+             "Simulated by Xyce (qspice-shim)\nTotal elapsed time: %.5g seconds.\n", secs);
+    post_text(hw, banner);
+    logline("posted completion to hWnd=%p", (void*)hw);
+}
+
 /* Drain our stdin to a file so it can be replayed for multiple children. */
 static int capture_stdin(const char *path)
 {
@@ -185,10 +217,14 @@ int main(void)
             fclose(af);
             snprintf(cmd, sizeof cmd, BRIDGE_CMD_FMT, pid);
             logline("route=xyce: %s (args file %s)", cmd, afile);
+            DWORD tstart = GetTickCount();
             rc = run(cmd, stdin_file);
             logline("xyce bridge rc=%lu", rc);
             DeleteFileA(afile);
-            if (rc == 0) goto done;
+            if (rc == 0) {
+                notify_qux(args, (GetTickCount() - tstart) / 1000.0);
+                goto done;
+            }
             logline("bridge failed; falling back to real engine");
         } else {
             logline("cannot write args file %s; falling back", afile);
