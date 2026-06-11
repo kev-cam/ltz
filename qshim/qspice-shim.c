@@ -19,8 +19,12 @@
 #include <stdarg.h>
 #include <string.h>
 
+/* Args cross the Windows->WSL boundary via a file: backslashes and quoted
+ * paths with spaces do not survive wsl.exe argv marshaling, but a bare PID
+ * does. The bridge reads and parses the original cmdline tail itself. */
+#define ARGS_DIR  "C:\\cygwin64\\tmp\\qshim-args"
 #define BRIDGE_CMD_FMT \
-  "wsl.exe -- bash /mnt/c/cygwin64/usr/local/src/ltz/qshim/bridge.sh %s"
+  "wsl.exe -- bash /mnt/c/cygwin64/usr/local/src/ltz/qshim/bridge.sh --pid %lu"
 
 static char logdir[MAX_PATH];
 
@@ -123,12 +127,24 @@ int main(void)
     char cmd[8192];
 
     if (_stricmp(mode, "xyce") == 0) {
-        snprintf(cmd, sizeof cmd, BRIDGE_CMD_FMT, args);
-        logline("route=xyce: %s", cmd);
-        DWORD rc = run(cmd);
-        logline("xyce bridge rc=%lu", rc);
-        if (rc == 0) return 0;
-        logline("bridge failed; falling back to real engine");
+        DWORD pid = GetCurrentProcessId();
+        CreateDirectoryA(ARGS_DIR, NULL);
+        char afile[MAX_PATH];
+        snprintf(afile, sizeof afile, "%s\\%lu.txt", ARGS_DIR, pid);
+        FILE *af = fopen(afile, "w");
+        if (af) {
+            fprintf(af, "%s\ncwd=%s\n", args, cwd);
+            fclose(af);
+            snprintf(cmd, sizeof cmd, BRIDGE_CMD_FMT, pid);
+            logline("route=xyce: %s (args file %s)", cmd, afile);
+            DWORD rc = run(cmd);
+            logline("xyce bridge rc=%lu", rc);
+            DeleteFileA(afile);
+            if (rc == 0) return 0;
+            logline("bridge failed; falling back to real engine");
+        } else {
+            logline("cannot write args file %s; falling back", afile);
+        }
     }
 
     if (GetFileAttributesA(real) == INVALID_FILE_ATTRIBUTES) {
