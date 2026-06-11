@@ -1,0 +1,16 @@
+* Mux_4_1_Behavioral.lib
+*
+* [ltz] Behavioral 4:1 analog mux — stand-in for the upstream ecircuit model
+* of the same name, which was not present in this corpus (ADC_SAR.LIB
+* .LIB-includes it and instantiates subckt Mux4_1_Behavioral). Port order is
+* taken from the XMux4_1 instantiation in ADC_SAR.LIB:
+*
+*   s0 = ATB_SEL[0], s1 = ATB_SEL[1]  (2-bit select, logic threshold 0.5 V)
+*   in0..in3                          (four analog inputs)
+*   out                              (selected input -> output)
+*
+* sel = 2*s1 + s0  ->  in0 (00), in1 (01), in2 (10), in3 (11)
+*
+.SUBCKT Mux4_1_Behavioral s0 s1 in0 in1 in2 in3 out
+Bmux out 0 V= (V(s1)>0.5) ? ((V(s0)>0.5) ? V(in3) : V(in2)) : ((V(s0)>0.5) ? V(in1) : V(in0))
+.ENDS Mux4_1_Behavioral
