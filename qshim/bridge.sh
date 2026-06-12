@@ -41,12 +41,12 @@ fi
 #   -pipe -QUX -Op "<schematic.qsch>" -r "<tmp.N.qraw>" -hWnd=<n>
 # with the NETLIST PIPED ON STDIN; -Op names the origin schematic (its dir
 # anchors relative includes), -hWnd is the GUI progress handle (ignored).
-deck=""; qraw=""; out=""; op_qsch=""
+deck=""; qraw=""; out=""; op_qsch=""; op_orig=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -r)      qraw="$2"; shift 2 ;;
     -o)      out="$2";  shift 2 ;;
-    -Op)     op_qsch="$2"; shift 2 ;;
+    -Op)     op_qsch="$2"; op_orig="$2"; shift 2 ;;
     -binary|-ascii|-pipe|-QUX) shift ;;
     -hWnd=*) shift ;;
     -simProcessID|-viewer) log "ignoring $1 $2"; shift 2 ;;   # viewer handshake
@@ -83,7 +83,7 @@ fi
 perl "$Q2X" -o "$xdeck" "$deck" >> "$LOG" 2>&1 || die "qspice2xyce"
 ( cd "$rundir" && timeout 600 "$XYCE" -r "$xraw" -a "$xdeck" ) >> "$LOG" 2>&1 || die "Xyce"
 [ -s "$xraw" ] || die "no Xyce rawfile"
-perl "$QSHIM_DIR/raw2qraw.pl" "$xraw" "$deck" > "$qraw" || die "raw2qraw"
+perl "$QSHIM_DIR/raw2qraw.pl" "$xraw" "$deck" "${op_orig:-$deck}" > "$qraw" || die "raw2qraw"
 [ -s "$qraw" ] || die "empty qraw"
 [ -n "$out" ] && { case "$out" in [A-Za-z]:*|*\\*) out=$(wslpath -u "$out");; esac
                    echo "Simulated by Xyce via qspice-shim" > "$out"; }

@@ -132,18 +132,86 @@ static void post_text(HWND hw, const char *s)
     PostMessageA(hw, 0x8100, 0, 0);
 }
 
-static void notify_qux(const char *args, double secs)
+/* Our own engine-side window: the real engine announces ITS window via
+ * 0x80FF (lParam = HWND) so QUX can send control/data requests back. We
+ * stand one up, announce it, and log everything QUX sends -- protocol
+ * discovery for the reverse direction. */
+static LRESULT CALLBACK engine_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m >= 0x8000 || (m >= WM_USER && m < 0x8000)) {
+        logline("QUX->shim msg=0x%04X wParam=0x%llX (%llu) lParam=0x%llX (%lld)",
+                m, (unsigned long long)w, (unsigned long long)w,
+                (unsigned long long)l, (long long)l);
+    }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static HWND make_engine_window(void)
+{
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = engine_wndproc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "qshim-engine";
+    RegisterClassA(&wc);
+    return CreateWindowA("qshim-engine", "qshim", 0, 0, 0, 10, 10,
+                         NULL, NULL, wc.hInstance, NULL);
+}
+
+static void pump_for(DWORD ms)
+{
+    DWORD end = GetTickCount() + ms;
+    MSG msg;
+    do {
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        Sleep(10);
+    } while (GetTickCount() < end);
+}
+
+/* run a child while pumping our window's messages */
+static DWORD run_pumped(const char *cmdline, const char *stdin_file)
+{
+    STARTUPINFOA si; PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof si); si.cb = sizeof si;
+    HANDLE hin = INVALID_HANDLE_VALUE;
+    if (stdin_file) {
+        SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
+        hin = CreateFileA(stdin_file, GENERIC_READ, FILE_SHARE_READ, &sa,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hin == INVALID_HANDLE_VALUE) return 127;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput  = hin;
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    }
+    char *cl = _strdup(cmdline);
+    BOOL ok = CreateProcessA(NULL, cl, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    free(cl);
+    if (hin != INVALID_HANDLE_VALUE) CloseHandle(hin);
+    if (!ok) { logline("CreateProcess FAILED (%lu): %s", GetLastError(), cmdline); return 127; }
+    for (;;) {
+        MSG msg;
+        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        if (WaitForSingleObject(pi.hProcess, 20) == WAIT_OBJECT_0) break;
+    }
+    DWORD rc = 1;
+    GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return rc;
+}
+
+static HWND qux_hwnd(const char *args)
 {
     const char *hp = strstr(args, "-hWnd=");
-    if (!hp) return;
+    if (!hp) return NULL;
     HWND hw = (HWND)(UINT_PTR)_strtoui64(hp + 6, NULL, 10);
-    if (!hw || !IsWindow(hw)) { logline("hWnd %p not a window; no notify", (void*)hw); return; }
-    PostMessageA(hw, 0x80FF, 0, 0x1C02CE);
-    char banner[256];
-    snprintf(banner, sizeof banner,
-             "Simulated by Xyce (qspice-shim)\nTotal elapsed time: %.5g seconds.\n", secs);
-    post_text(hw, banner);
-    logline("posted completion to hWnd=%p", (void*)hw);
+    if (!hw || !IsWindow(hw)) { logline("hWnd %p not a window", (void*)hw); return NULL; }
+    return hw;
 }
 
 /* Drain our stdin to a file so it can be replayed for multiple children. */
@@ -217,12 +285,29 @@ int main(void)
             fclose(af);
             snprintf(cmd, sizeof cmd, BRIDGE_CMD_FMT, pid);
             logline("route=xyce: %s (args file %s)", cmd, afile);
+            HWND qux = qux_hwnd(args);
+            HWND eng = NULL;
+            if (qux) {
+                /* announce our engine window like the real engine does, then
+                   pump during the run so QUX's replies reach us (and the log) */
+                eng = make_engine_window();
+                logline("engine window=%p announced to QUX=%p", (void*)eng, (void*)qux);
+                PostMessageA(qux, 0x80FF, 0, (LPARAM)(UINT_PTR)eng);
+            }
             DWORD tstart = GetTickCount();
-            rc = run(cmd, stdin_file);
+            rc = run_pumped(cmd, stdin_file);
             logline("xyce bridge rc=%lu", rc);
             DeleteFileA(afile);
             if (rc == 0) {
-                notify_qux(args, (GetTickCount() - tstart) / 1000.0);
+                if (qux) {
+                    char banner[256];
+                    snprintf(banner, sizeof banner,
+                             "Simulated by Xyce (qspice-shim)\nTotal elapsed time: %.5g seconds.\n",
+                             (GetTickCount() - tstart) / 1000.0);
+                    post_text(qux, banner);
+                    logline("posted completion text; pumping 3s for QUX replies");
+                    pump_for(3000);
+                }
                 goto done;
             }
             logline("bridge failed; falling back to real engine");

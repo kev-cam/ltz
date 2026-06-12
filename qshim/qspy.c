@@ -66,6 +66,8 @@ int main(int argc, char **argv)
         fprintf(lg, "spawn failed %lu\n", GetLastError()); return 2;
     }
     CloseHandle(hin);
+    fprintf(lg, "engine pid=%lu (0x%lX)\n", pi.dwProcessId, pi.dwProcessId);
+    fflush(lg);
 
     /* pump until the engine exits, then 2s grace for trailing messages */
     DWORD deadline = 0;

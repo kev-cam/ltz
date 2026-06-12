@@ -12,8 +12,9 @@ use warnings;
 use POSIX qw(strftime);
 
 my $ascii = grep { $_ eq '--ascii' } @ARGV;
-my ($xraw, $deck) = grep { $_ ne '--ascii' } @ARGV;
-die "usage: $0 xyce.raw orig_deck [--ascii]\n" unless $xraw && $deck;
+my @pos = grep { $_ ne '--ascii' } @ARGV;
+my ($xraw, $deck, $title_path) = @pos;
+die "usage: $0 xyce.raw orig_deck [title_path] [--ascii]\n" unless $xraw && $deck;
 
 open my $fh, '<', $xraw or die "cannot read $xraw\n";
 my (@names, @types, $nv, $np, $plot, $cplx);
@@ -53,19 +54,44 @@ for my $i (0 .. $#names) {
     push @qnames, $n;
 }
 
-my $title = $deck;
-print "Title: * $title (Xyce via qspice-shim)\n";
+# Header mimics QSPICE64's own binary output byte-for-byte in structure:
+# QUX's loader is strict -- capital-T "Time", space-padded Abscissa and
+# No. Points fields (the engine rewrites them in place), the QSPICE64
+# Command identity line, and the .param temp line.
+my $title = $title_path // $deck;
+print "Title: * $title\n";
 print 'Date: ' . strftime('%a %b %e %H:%M:%S %Y', localtime) . "\n";
 print 'Plotname: ' . ($plot // 'Transient Analysis') . "\n";
+# QUX auto-plots ONLY what "Plot Suggestion(s)" names (0xAB/0xBB guillemet
+# delimited) -- without it the waveform window opens empty. Derive from the
+# deck's .plot/.print directives.
+{
+    my @sugg;
+    if (open my $dfh, '<', $deck) {
+        while (my $dl = <$dfh>) {
+            next unless $dl =~ /^\s*\.(?:plot|print)\s+(.*)$/i;
+            my $items = $1;
+            $items =~ s/^\s*(?:tran|ac|dc|noise)\b\s*//i;
+            push @sugg, grep { length } map { s/^\s+|\s+$//gr } split /\s*,\s*/, $items;
+        }
+        close $dfh;
+    }
+    print 'Plot Suggestion(s): ' . join(' ', map { "\xAB$_\xBB" } @sugg) . "\n"
+        if @sugg;
+}
 print 'Flags: ' . ($cplx ? 'complex' : 'real') . "\n";
-printf "Abscissa: %24.15e %24.15e\n", $rows[0][0], $rows[-1][0] if !$cplx;
-print "No. Variables: $nv\n";
-print "No. Points: $np\n";
-print "Command: Xyce (qspice-shim bridge)\n";
+printf "Abscissa:  %24.15e  %24.15e%s\n", $rows[0][0], $rows[-1][0], ' ' x 21
+    if !$cplx;
+printf "No. Variables: %d\n", $nv;
+printf "No. Points: %-17d\n", $np;
+print "Command: QSPICE64, Build May 28 2026 12:25:18\n";
+print ".param temp=27\n";
 print "Variables:\n";
 for my $i (0 .. $#qnames) {
     my $t = $i == 0 ? ($qnames[0] eq 'frequency' ? 'frequency' : 'time') : lc $types[$i];
-    print "\t$i\t$qnames[$i]\t$t\n";
+    my $n = $qnames[$i];
+    $n = 'Time' if $i == 0 && lc($n) eq 'time';
+    print "\t$i\t$n\t$t\n";
 }
 if ($ascii) {
     print "Values:\n";
