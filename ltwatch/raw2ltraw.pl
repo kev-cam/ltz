@@ -8,6 +8,7 @@
 use strict;
 use warnings;
 use POSIX qw(strftime);
+binmode(STDOUT, ':crlf');   # LTspice's reader expects CRLF line endings
 use lib '/usr/local/src/sv2ghdl/regress/lib';
 use Regress::RawCompare qw(read_raw);
 

@@ -44,8 +44,8 @@ while :; do
           xr="$base.ltwatch.xraw"
           rm -f "$xr"
           if timeout 600 "$LTZ" -b "$base.net" -r "$xr" >> "$LOG" 2>&1 && [ -s "$xr" ]; then
-            perl "$HERE/raw2ltraw.pl" "$xr" "$(wslpath -w "$asc")" > "$base.raw" \
-              && log "  $name: Xyce OK -> $name.raw (open it in LTspice)" \
+            perl "$HERE/raw2ltraw.pl" "$xr" "$(wslpath -w "$asc")" > "${base}_xyce.raw" \
+              && log "  $name: Xyce OK -> ${name}_xyce.raw (open it in LTspice)" \
               || log "  $name: raw conversion failed"
           else
             log "  $name: translate/Xyce failed (see $LOG)"
