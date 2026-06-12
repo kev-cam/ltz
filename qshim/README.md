@@ -31,7 +31,7 @@ Uninstall: same with `-Restore`. The real engines are kept beside the shim as
 x86_64-w64-mingw32-gcc -O2 -s -o qspice-shim.exe qspice-shim.c   # in WSL
 ```
 
-## Status / caveats
+## Status
 - Validated in sandbox: file-based invocation (`deck.cir -ascii -r out.qraw`)
   end-to-end, 4s wall. The qraw carries QSPICE spellings (V(x), I(src)).
 - QUX's marching-waveform mode pipes the netlist on **stdin** and may expect a
@@ -43,3 +43,12 @@ x86_64-w64-mingw32-gcc -O2 -s -o qspice-shim.exe qspice-shim.c   # in WSL
   qspice2xyce.pl, this dir reachable at
   `/mnt/c/cygwin64/usr/local/src/ltz/qshim` (path baked into the shim;
   rebuild if relocated).
+
+## Working (2026-06-11)
+GUI-on-Xyce confirmed end to end: Run in QUX -> shim -> WSL bridge -> Xyce ->
+binary .qraw with Plot Suggestion(s) -> waveform displayed (AudioAmp, ~5s).
+The protocol pieces that mattered: netlist arrives on stdin (-pipe); args
+cross to WSL via an args-file (backslashes/quotes don't survive wsl.exe argv
+marshaling); the .qraw must be BINARY with a byte-faithful header; QUX
+auto-plots only what "Plot Suggestion(s):" names; 0x80FF announces the
+engine's own window (HWND), 0x8100 streams console text 8 chars/post.
