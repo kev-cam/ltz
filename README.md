@@ -77,25 +77,36 @@ Xyce tests/converted/00_RC_LOW_PASS_FILTER/Lpfilter1.cir
 ltz/
 ├── MISSION.md              # Project vision
 ├── README.md
+├── REQUIREMENTS.md         # Interactive Xyce control — requirements
+├── bin/                    # Drop-in CLI front-ends that run circuits through Xyce
+│   ├── LTspice             #   LTspice-compatible front-end → Xyce
+│   ├── ltz                 #   ltz driver
+│   └── ltz-kicad           #   KiCad-integrated driver
 ├── docs/
 │   ├── INSTALL-Windows.md  # Windows / WSL setup walkthrough
 │   └── LTSPICE_XYCE_HANDOFF.md
-├── sims/                   # WSL SPICE-engine funnel: /opt/sims registry + bootstrap
-│   ├── bootstrap.ps1       #   fresh Windows → WSL Ubuntu + engines
-│   ├── install-sims.sh     #   build the engine registry
-│   ├── pack-artifacts.sh   #   capture non-apt state (makes WSL disposable)
-│   ├── sims                #   manager: list/run/doctor/repair/extras/update/sync
-│   └── sims-autoupdate.sh  #   regression-gated engine promote/rollback
+├── examples/               # Runnable demos: RC filter, PLL, KiCad projects
+├── lib/                    # ngspice_shim/ (KiCad↔ngspice) + standard.lib models
+├── ltwatch/                # View Xyce output in the LTspice waveform viewer
+│   ├── ltwatch.sh
+│   └── raw2ltraw.pl        #   Xyce .raw → LTspice .raw
+├── pop/                    # ltz-pop: netlist parse/generate (see PLAN.md)
 ├── qshim/                  # QSPICE-GUI shim → funnel decks to Xyce / ngspice
 │   ├── bridge.sh           #   WSL pipeline: translate → sim → .qraw
 │   ├── va2ngspice.pl       #   Verilog-A → OSDI (OpenVAF) for ngspice
 │   └── install.ps1         #   swap the QSPICE engine exe for the shim
 ├── scripts/
 │   └── fetch_tests.sh      # Populates ../ltz-tests with community circuits
+├── sims/                   # WSL SPICE-engine funnel: /opt/sims registry + bootstrap
+│   ├── bootstrap.ps1       #   fresh Windows → WSL Ubuntu + engines
+│   ├── install-sims.sh     #   build the engine registry
+│   ├── pack-artifacts.sh   #   capture non-apt state (makes WSL disposable)
+│   ├── sims                #   manager: list/run/doctor/repair/extras/update/sync
+│   └── sims-autoupdate.sh  #   regression-gated engine promote/rollback
 ├── tools/
 │   └── ltz_convert.py      # LTspice → Xyce netlist converter
 └── tests/
-    └── converted/           # Xyce-ready netlists (generated)
+    └── converted/          # Xyce-ready netlists (generated)
 
 ../ltz-tests/                # Sibling dir (not in repo, created by fetch_tests.sh)
 ├── circuits-ltspice/        # mick001 educational circuits
