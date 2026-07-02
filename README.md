@@ -12,6 +12,13 @@ LTspice and Qspice are closed-source, single-threaded, vendor-locked dead ends. 
 
 Early development. See [MISSION.md](MISSION.md) for the full vision.
 
+## Running on Windows
+
+The SPICE engines run under WSL, and a QSPICE-GUI shim can funnel schematics to
+**Xyce**, **Xyce-MPI**, or **ngspice**. See
+**[docs/INSTALL-Windows.md](docs/INSTALL-Windows.md)** for the end-to-end setup
+(`sims/` bootstrap + engine registry, `qshim/` GUI shim).
+
 ## Architecture
 
 ```
