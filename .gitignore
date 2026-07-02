@@ -1,2 +1,5 @@
 qshim/bridge.log
 qshim/shim.log
+*.bak
+__pycache__/
+*.egg-info/

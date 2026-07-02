@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+#
+# sims -- manager for the /opt/sims engine registry + dev environment.
+#
+#   sims list                     installed engines / versions / current
+#   sims run <engine[@ver]> ...    run an engine (same as /opt/sims/sim)
+#   sims doctor [engine]           health-check engines + components (PASS/FAIL)
+#   sims repair                    doctor, then fix only what's broken
+#   sims extras [list|<name>...]   install optional components (glayout, devtools, kestrel)
+#   sims add|remove <engine[@ver]> register / drop an engine version
+#   sims update [--dry-run]        regression-gated promote/rollback (catalog.conf)
+#   sims sync                      reconcile the install to sims.conf (the manifest)
+#   sims pack [dir]                capture artifacts (pack-artifacts.sh)
+#   sims help
+#
+# The manifest /opt/sims/sims.conf declares the *desired* environment; `sims
+# sync` makes the install match it (incremental -- touches only diffs). Fork it
+# per box. Restores pull from the artifacts dir (default below).
+set -o pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin
+
+ROOT=/opt/sims
+MANIFEST="${SIMS_CONF:-$ROOT/sims.conf}"
+ARTIFACTS="${SIMS_ARTIFACTS:-/mnt/c/cygwin64/home/Claude/sims-artifacts}"
+REPO="${SIMS_REPO:-/usr/local/src/ltz/sims}"
+ok(){ printf '  \033[32mPASS\033[0m %s\n' "$*"; }
+bad(){ printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILS=$((FAILS+1)); }
+warn(){ printf '  \033[33mWARN\033[0m %s\n' "$*"; }
+say(){ echo "[sims] $*"; }
+
+engines(){ for e in "$ROOT"/*/; do local n; n=$(basename "$e"); [ -e "$e/current/run" ] && echo "$n"; done; }
+have_artifact(){ [ -f "$ARTIFACTS/$1" ]; }
+
+cmd_list(){
+  for e in "$ROOT"/*/; do
+    local n; n=$(basename "$e"); [ -d "$e" ] || continue
+    local cur vers; cur=$(readlink "$e/current" 2>/dev/null)
+    vers=$(for v in "$e"*/; do basename "$v"; done 2>/dev/null | grep -v '^current$' | tr '\n' ' ')
+    [ -n "$vers" ] && printf '%-12s current=%-10s versions: %s\n' "$n" "${cur:-?}" "$vers"
+  done
+}
+
+cmd_run(){ exec "$ROOT/sim" "$@"; }
+
+# ---- doctor -----------------------------------------------------------------
+check_engine(){  # name
+  local n="$1"            # NB: split locals -- bash doesn't backref within one `local`
+  local run="$ROOT/$n/current/run"
+  local lib="$ROOT/$n/current/lib"
+  local bin
+  [ -x "$run" ] || { bad "$n: no current/run"; return; }
+  bin=$(ls "$ROOT/$n/current/bin/"* 2>/dev/null | head -1)
+  [ -x "$bin" ] || { bad "$n: no binary"; return; }
+  local missing
+  missing=$(LD_LIBRARY_PATH="$lib" ldd "$bin" 2>/dev/null | grep -c 'not found')
+  [ "$missing" = 0 ] || { bad "$n: $missing unresolved shared libs"; return; }
+  case "$n" in
+    ngspice)
+      [ -n "$(ls "$ROOT/$n/current/lib/ngspice/"*.cm 2>/dev/null)" ] || { bad "$n: no bundled codemodels"; return; }
+      [ -f "$ROOT/$n/current/share/ngspice/scripts/spinit" ] || { bad "$n: no bundled spinit"; return; }
+      "$run" -v 2>&1 | grep -qi ngspice || { bad "$n: -v failed"; return; } ;;
+    xyce*)
+      "$run" -v 2>&1 | grep -qi xyce || { bad "$n: -v failed"; return; } ;;
+  esac
+  ok "$n: binary + libs + smoke ok"
+}
+check_component(){  # label test... (test is a command)
+  local label="$1"; shift
+  if "$@" >/dev/null 2>&1; then ok "$label"; else bad "$label"; fi
+}
+cmd_doctor(){
+  FAILS=0
+  echo "engines:"
+  if [ -n "${1:-}" ]; then check_engine "$1"; else for e in $(engines); do check_engine "$e"; done; fi
+  echo "components:"
+  if [ -x /opt/openvaf/openvaf ]; then check_component "openvaf runs" /opt/openvaf/openvaf --version; else warn "openvaf not installed"; fi
+  if [ -d /opt/pdk/sky130A ]; then ok "pdk sky130A present"; else warn "pdk sky130 not installed"; fi
+  if [ -d /opt/glayout-env ]; then ok "glayout-env present"; else warn "glayout-env not installed (extra)"; fi
+  local sk="$HOME/.ssh/id_rsa"
+  if [ -f "$sk" ]; then
+    [ "$(stat -c '%a' "$sk")" = 600 ] && ok "ssh id_rsa perms 600" || bad "ssh id_rsa perms $(stat -c '%a' "$sk") (want 600)"
+  else warn "no ssh id_rsa"; fi
+  echo
+  [ "$FAILS" = 0 ] && { say "doctor: all checks passed"; return 0; } || { say "doctor: $FAILS failure(s)"; return 1; }
+}
+
+# ---- repair (fix only what doctor flags) ------------------------------------
+restore_artifact(){  # tarball into sentinel
+  have_artifact "$1" || { warn "no artifact $1 to restore"; return 1; }
+  say "restoring $1 -> $2"; mkdir -p "$2"; tar -xzf "$ARTIFACTS/$1" -C "$2"
+}
+cmd_repair(){
+  say "running doctor..."
+  cmd_doctor >/tmp/sims_doctor.$$ 2>&1 || true
+  cat /tmp/sims_doctor.$$
+  if ! grep -q FAIL /tmp/sims_doctor.$$; then rm -f /tmp/sims_doctor.$$; say "nothing to repair"; return 0; fi
+  say "repairing..."
+  # doctor prints "FAIL <name>: ..."; match on the failed lines (name after FAIL)
+  local F; F=$(grep -i FAIL /tmp/sims_doctor.$$)
+  echo "$F" | grep -qi 'ngspice'        && { say "rebundling ngspice"; bash "$REPO/install-sims.sh" >/dev/null 2>&1 || true; }
+  echo "$F" | grep -qiE 'xyce(-mpi)?:'  && restore_artifact sims-xyce.tar.gz /opt/sims /opt/sims/xyce
+  echo "$F" | grep -qi 'openvaf'        && restore_artifact openvaf.tar.gz /opt /opt/openvaf
+  echo "$F" | grep -qi 'pdk'            && restore_artifact pdk-sky130.tar.gz /opt /opt/pdk
+  echo "$F" | grep -qi 'ssh'            && { chmod 700 "$HOME/.ssh" 2>/dev/null; chmod 600 "$HOME/.ssh/"* 2>/dev/null; chmod 644 "$HOME/.ssh/"*.pub 2>/dev/null; say "fixed ssh perms"; }
+  rm -f /tmp/sims_doctor.$$
+  say "re-checking..."; cmd_doctor
+}
+
+# ---- extras catalog ---------------------------------------------------------
+extra_glayout(){
+  if [ "${1:-install}" = pack ]; then
+    [ -d /opt/glayout-env ] || { warn "no /opt/glayout-env to pack"; return 1; }
+    mkdir -p "$ARTIFACTS"; ( cd /opt && tar -czf "$ARTIFACTS/glayout-env.tar.gz" glayout-env ); say "packed glayout-env"
+  else
+    [ -d /opt/glayout-env ] && { say "glayout-env already present"; return 0; }
+    restore_artifact glayout-env.tar.gz /opt /opt/glayout-env || { warn "no glayout-env artifact; pack it on the golden box (sims extras glayout pack)"; return 1; }
+  fi
+}
+extra_devtools(){ say "apt: git build-essential gtkwave vim"; sudo apt-get install -y --no-install-recommends git build-essential gtkwave vim; }
+extra_kestrel(){
+  # kev-cam/kestrel: a pure-Python PLL / circuit generator (emits Verilog-AMS +
+  # SPICE + KiCad + an ngspice/OSDI testbench -> runs on the funnel engines).
+  local SRC=/usr/local/src/kestrel SUDO=""
+  [ "$(id -u)" = 0 ] || SUDO="sudo"
+  if [ "${1:-install}" = pack ]; then
+    [ -d /opt/kestrel ] || { warn "no /opt/kestrel to pack"; return 1; }
+    mkdir -p "$ARTIFACTS"; ( cd /opt && tar -czf "$ARTIFACTS/kestrel.tar.gz" kestrel ); say "packed kestrel"; return
+  fi
+  [ -x /opt/kestrel/bin/kestrel ] && { say "kestrel already installed"; return 0; }
+  if have_artifact kestrel.tar.gz; then restore_artifact kestrel.tar.gz /opt /opt/kestrel
+    [ -x /opt/kestrel/bin/kestrel ] && { say "kestrel restored from artifact"; return 0; }; fi
+  command -v git >/dev/null || { warn "kestrel needs git"; return 1; }
+  python3 -c 'import ensurepip' 2>/dev/null || $SUDO apt-get install -y --no-install-recommends python3-venv python3-pip >/dev/null 2>&1
+  [ -d "$SRC/.git" ] || git clone --depth 1 https://github.com/kev-cam/kestrel "$SRC" || { warn "kestrel clone failed"; return 1; }
+  $SUDO rm -rf /opt/kestrel; $SUDO mkdir -p /opt/kestrel/bin; $SUDO chown -R "$(id -un):$(id -gn)" /opt/kestrel
+  python3 -m venv /opt/kestrel/venv || { warn "venv failed (python3-venv?)"; return 1; }
+  /opt/kestrel/venv/bin/pip install -q --upgrade pip setuptools >/dev/null 2>&1
+  /opt/kestrel/venv/bin/pip install -q -e "$SRC" || { warn "kestrel pip install failed"; return 1; }
+  printf '#!/bin/sh\nexec /opt/kestrel/venv/bin/kestrel "$@"\n' > /opt/kestrel/bin/kestrel; chmod +x /opt/kestrel/bin/kestrel
+  $SUDO ln -sfn /opt/kestrel/bin/kestrel /usr/local/bin/kestrel 2>/dev/null
+  say "kestrel installed -> kestrel (PLL generator); source $SRC"
+}
+cmd_extras(){
+  case "${1:-list}" in
+    list|"") echo "available extras: glayout(glayout-env)  devtools(git/gtkwave/...)  kestrel(PLL generator)";
+             for x in glayout devtools kestrel; do
+               local state="not installed"
+               { [ "$x" = glayout ] && [ -d /opt/glayout-env ]; } && state="installed"
+               { [ "$x" = kestrel ] && [ -x /opt/kestrel/bin/kestrel ]; } && state="installed"
+               { [ "$x" = devtools ] && command -v gtkwave >/dev/null 2>&1; } && state="installed"
+               printf '  %-10s %s\n' "$x" "$state"
+             done ;;
+    *) for x in "$@"; do
+         case "$x" in
+           glayout)  extra_glayout install ;;
+           glayout-pack) extra_glayout pack ;;
+           devtools) extra_devtools ;;
+           kestrel)  extra_kestrel ;;
+           kestrel-pack) extra_kestrel pack ;;
+           *) warn "unknown extra: $x" ;;
+         esac
+       done ;;
+  esac
+}
+
+# ---- add / remove / sync (manifest) -----------------------------------------
+cmd_remove(){
+  local spec="${1:?usage: sims remove <engine[@ver]>}"
+  local e="${spec%@*}" v="${spec##*@}"
+  [ "$v" = "$spec" ] && { rm -rf "${ROOT:?}/$e"; say "removed engine $e"; } || { rm -rf "${ROOT:?}/$e/$v"; say "removed $e@$v"; }
+}
+cmd_add(){ local spec="${1:?usage: sims add <engine[@ver]>}"
+  # artifact-based add for xyce family; ngspice via install-sims
+  case "$spec" in
+    xyce|xyce-mpi|xyce@*|xyce-mpi@*) restore_artifact sims-xyce.tar.gz /opt/sims /opt/sims/xyce && say "added from artifact" ;;
+    ngspice*) bash "$REPO/install-sims.sh" >/dev/null 2>&1 && say "ngspice (re)installed" ;;
+    *) warn "no add recipe for $spec (artifact or catalog needed)" ;;
+  esac
+}
+cmd_sync(){
+  [ -f "$MANIFEST" ] || { warn "no manifest $MANIFEST"; return 1; }
+  say "reconciling install -> $MANIFEST"
+  while read -r kind name ver; do
+    case "$kind" in
+      ''|'#'*) continue ;;
+      engine) if [ -x "$ROOT/$name/current/run" ]; then ok "engine $name present"; else say "engine $name missing -> add"; cmd_add "$name"; fi ;;
+      extra)  if { [ "$name" = glayout ] && [ -d /opt/glayout-env ]; } || { [ "$name" = kestrel ] && [ -d /opt/kestrel ]; }; then ok "extra $name present"; else say "extra $name missing -> install"; cmd_extras "$name"; fi ;;
+      *) warn "unknown manifest line: $kind $name $ver" ;;
+    esac
+  done < "$MANIFEST"
+}
+
+cmd_pack(){ bash "$REPO/pack-artifacts.sh" "${1:-}"; }
+cmd_update(){ local s="$ROOT/sims-autoupdate.sh"; [ -x "$s" ] || s="$REPO/sims-autoupdate.sh"; bash "$s" "$@"; }
+
+case "${1:-help}" in
+  list)   shift; cmd_list "$@" ;;
+  run)    shift; cmd_run "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
+  repair) shift; cmd_repair "$@" ;;
+  extras) shift; cmd_extras "$@" ;;
+  add)    shift; cmd_add "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  update) shift; cmd_update "$@" ;;   # regression-gated promote/rollback (catalog.conf)
+  sync)   shift; cmd_sync "$@" ;;
+  pack)   shift; cmd_pack "$@" ;;
+  help|-h|--help) sed -n '2,22p' "$0" | sed 's/^#//' ;;
+  *) cmd_run "$@" ;;   # bare `sims xyce ...` runs an engine
+esac

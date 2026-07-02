@@ -49,8 +49,10 @@ my @qnames;
 for my $i (0 .. $#names) {
     my ($n, $t) = ($names[$i], lc $types[$i]);
     if ($n =~ /^(?:time|frequency|sweep)$/i) { push @qnames, lc $n; next; }
-    if ($n =~ /^(\w+)#branch$/i)             { push @qnames, 'I(' . uc($1) . ')'; next; }
-    if ($t eq 'voltage')                     { push @qnames, 'V(' . lc($n) . ')'; next; }
+    if ($n =~ /^v\((.+)\)$/i)                { push @qnames, 'V(' . lc($1) . ')'; next; }  # ngspice node
+    if ($n =~ /^i\((.+)\)$/i)                { push @qnames, 'I(' . uc($1) . ')'; next; }  # ngspice branch
+    if ($n =~ /^(\w+)#branch$/i)             { push @qnames, 'I(' . uc($1) . ')'; next; }  # xyce branch
+    if ($t eq 'voltage')                     { push @qnames, 'V(' . lc($n) . ')'; next; }  # xyce node
     push @qnames, $n;
 }
 

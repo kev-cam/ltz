@@ -1,10 +1,13 @@
 # install.ps1 — swap the QSPICE engine exes for the Xyce shim. RUN ELEVATED.
 #   powershell -ExecutionPolicy Bypass -File install.ps1            # install
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Update    # refresh shim only
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Restore   # uninstall
-# Mode control afterwards (no elevation needed):
-#   echo xyce     > $env:LOCALAPPDATA\qspice-shim\mode.txt   # GUI sims run on Xyce
+# Mode control afterwards (no elevation needed) -- pick the engine to funnel to:
+#   echo xyce     > $env:LOCALAPPDATA\qspice-shim\mode.txt   # GUI sims on /opt/sims xyce
+#   echo xyce-mpi > $env:LOCALAPPDATA\qspice-shim\mode.txt   # ... on xyce-mpi
+#   echo ngspice  > $env:LOCALAPPDATA\qspice-shim\mode.txt   # ... on ngspice
 #   echo passthru > $env:LOCALAPPDATA\qspice-shim\mode.txt   # real QSPICE engine
-param([switch]$Restore)
+param([switch]$Restore, [switch]$Update)
 
 $qdir = 'C:\Program Files\QSPICE'
 $shim = Join-Path $PSScriptRoot 'qspice-shim.exe'
@@ -26,6 +29,17 @@ if ($Restore) {
 }
 
 if (-not (Test-Path $shim)) { Write-Error "build qspice-shim.exe first"; exit 1 }
+
+if ($Update) {
+    foreach ($e in $engines) {
+        $cur  = Join-Path $qdir $e
+        $real = Join-Path $qdir ($e -replace '\.exe$', '.real.exe')
+        if (-not (Test-Path $real)) { Write-Host "skip $e (shim not installed; run without -Update first)"; continue }
+        Copy-Item $shim $cur -Force
+        Write-Host "refreshed shim for $e"
+    }
+    exit 0
+}
 
 foreach ($e in $engines) {
     $cur  = Join-Path $qdir $e

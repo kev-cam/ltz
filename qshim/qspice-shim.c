@@ -6,8 +6,10 @@
  * shim in as <name>.exe. Behavior is controlled by the first line of
  *   %LOCALAPPDATA%\qspice-shim\mode.txt
  *     passthru   (default) log the invocation, run the real engine
- *     xyce       run the WSL Xyce bridge; fall back to the real engine if
- *                the bridge exits nonzero (the GUI never breaks)
+ *     <engine>   any other token routes to the WSL bridge, which resolves it
+ *                against /opt/sims (xyce, xyce-mpi, ngspice, or engine@version)
+ *                and falls back to the real engine if the bridge exits nonzero
+ *                (the GUI never breaks)
  *
  * Every invocation appends a record to %LOCALAPPDATA%\qspice-shim\shim.log:
  * command line, working directory, whether stdin is a pipe (QUX pipes the
@@ -275,16 +277,16 @@ int main(void)
 
     DWORD rc = 127;
 
-    if (_stricmp(mode, "xyce") == 0) {
+    if (_stricmp(mode, "passthru") != 0) {
         CreateDirectoryA(ARGS_DIR, NULL);
         char afile[MAX_PATH];
         snprintf(afile, sizeof afile, "%s\\%lu.txt", ARGS_DIR, pid);
         FILE *af = fopen(afile, "w");
         if (af) {
-            fprintf(af, "%s\ncwd=%s\n", args, cwd);
+            fprintf(af, "%s\ncwd=%s\nengine=%s\n", args, cwd, mode);
             fclose(af);
             snprintf(cmd, sizeof cmd, BRIDGE_CMD_FMT, pid);
-            logline("route=xyce: %s (args file %s)", cmd, afile);
+            logline("route=%s: %s (args file %s)", mode, cmd, afile);
             HWND qux = qux_hwnd(args);
             HWND eng = NULL;
             if (qux) {
@@ -296,14 +298,14 @@ int main(void)
             }
             DWORD tstart = GetTickCount();
             rc = run_pumped(cmd, stdin_file);
-            logline("xyce bridge rc=%lu", rc);
+            logline("%s bridge rc=%lu", mode, rc);
             DeleteFileA(afile);
             if (rc == 0) {
                 if (qux) {
                     char banner[256];
                     snprintf(banner, sizeof banner,
-                             "Simulated by Xyce (qspice-shim)\nTotal elapsed time: %.5g seconds.\n",
-                             (GetTickCount() - tstart) / 1000.0);
+                             "Simulated by %s (qspice-shim)\nTotal elapsed time: %.5g seconds.\n",
+                             mode, (GetTickCount() - tstart) / 1000.0);
                     post_text(qux, banner);
                     logline("posted completion text; pumping 3s for QUX replies");
                     pump_for(3000);
