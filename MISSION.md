@@ -30,6 +30,8 @@ Unifying **KiCad** — the world's leading open-source schematic capture and PCB
 
 5. **A federated simulation bridge** connecting Xyce to open-source digital simulators (NVC, gHDL, Verilator) for mixed-signal and multi-die verification that no closed-source tool offers at any price.
 
+**Shipping now:** the [WSL SPICE-engine funnel](sims/README.md) already runs QSPICE-GUI (and LTspice) decks on **Xyce**, **Xyce-MPI**, or **ngspice** — including Verilog-A via OpenVAF/OSDI — with a [one-page Windows setup](docs/INSTALL-Windows.md). Uninstalling the proprietary engine starts here.
+
 ### Who This Is For
 
 Every engineer who has hit an LTspice convergence wall at 2 AM. Every team that needs batch simulation in CI/CD and can't script a GUI. Every startup that refuses to build on a platform whose source code they'll never see. Every researcher who needs parallel SPICE and shouldn't have to pay six figures for it. Every designer staring down a chiplet interposer and finding zero affordable tools for the job.
